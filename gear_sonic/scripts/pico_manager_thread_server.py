@@ -85,6 +85,14 @@ except ImportError:
     G1GripperInverseKinematicsSolver = None
 
 try:
+    from gear_sonic.utils.teleop.solver.hand.inspire_hand_controller import (
+        InspireHandController,
+    )
+except ImportError:
+    print("Warning: InspireHandController not available.")
+    InspireHandController = None
+
+try:
     from gear_sonic.utils.teleop.vis.vr3pt_pose_visualizer import VR3PtPoseVisualizer
 except ImportError:
     print("Warning: VR3PtPoseVisualizer not available (pyvista may not be installed).")
@@ -1814,6 +1822,7 @@ def run_pico_manager(
     with_g1_robot: bool = True,
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
+    hand_type: str = "dex3",
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -1831,6 +1840,17 @@ def run_pico_manager(
     while not xrt.is_body_data_available():
         print("waiting for body data...")
         time.sleep(1)
+
+    # Initialize Inspire hand controller if requested
+    inspire_controller = None
+    if hand_type == "inspire":
+        if InspireHandController is None:
+            raise ImportError("InspireHandController not available. Check dex_retargeting installation.")
+        from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+        ChannelFactoryInitialize(0)  # domain_id=0 for real robot
+        inspire_controller = InspireHandController(mode="DFX", fps=50.0)
+        inspire_controller.start()
+        print("[Manager] Inspire hand controller started")
 
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
@@ -1910,6 +1930,16 @@ def run_pico_manager(
             left_menu_button, _, _, _, _ = get_controller_inputs()
 
             left_axis_click, _ = get_axis_clicks()
+
+            # Feed PICO hand tracking to Inspire controller
+            if inspire_controller is not None:
+                try:
+                    left_ht = xrt.get_left_hand_tracking_state() if xrt.get_left_hand_is_active() else None
+                    right_ht = xrt.get_right_hand_tracking_state() if xrt.get_right_hand_is_active() else None
+                    if left_ht is not None and right_ht is not None:
+                        inspire_controller.update(left_ht, right_ht)
+                except Exception:
+                    pass
 
             # Rising edge: A+X pressed together -> toggle POSE/PLANNER mode
             ax_pressed = (a_pressed) and (x_pressed)
@@ -2047,6 +2077,8 @@ def run_pico_manager(
         # Cleanup resources
         reader.stop()
         three_point.close()
+        if inspire_controller is not None:
+            inspire_controller.stop()
         socket.close()
         context.term()
         print("[Manager] Shutdown complete")
@@ -2136,6 +2168,13 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable SMPL body joint visualization (24 joint spheres) in the VR3pt viewer",
     )
+    parser.add_argument(
+        "--hand-type",
+        type=str,
+        choices=["dex3", "inspire", "none"],
+        default="dex3",
+        help="Hand type: 'dex3' (default 3-finger gripper), 'inspire' (Inspire dexterous hand), 'none' (no hand control)",
+    )
     args = parser.parse_args()
 
     # Standalone VR3Pt test modes (exit after finishing)
@@ -2176,6 +2215,7 @@ if __name__ == "__main__":
             with_g1_robot=with_g1_robot,
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
+            hand_type=args.hand_type,
         )
     else:
         # Run legacy single-thread pose streaming
