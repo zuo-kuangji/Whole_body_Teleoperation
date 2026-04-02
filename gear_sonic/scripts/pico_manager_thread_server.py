@@ -1848,7 +1848,8 @@ def run_pico_manager(
         if InspireHandController is None:
             raise ImportError("InspireHandController not available. Check dex_retargeting installation.")
         from unitree_sdk2py.core.channel import ChannelFactoryInitialize
-        ChannelFactoryInitialize(0)  # domain_id=0 for real robot
+        dds_interface = "lo" if hand_sim else ""
+        ChannelFactoryInitialize(0, dds_interface)
         inspire_controller = InspireHandController(mode="DFX", fps=50.0, sim=hand_sim)
         inspire_controller.start()
         print("[Manager] Inspire hand controller started")
