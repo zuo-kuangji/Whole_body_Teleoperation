@@ -1,0 +1,82 @@
+cd ~/hsj/GR00T-WholeBodyControl/gear_sonic_deploy
+export TensorRT_ROOT=$HOME/TensorRT
+source scripts/setup_env.sh
+echo $TensorRT_ROOT
+just build
+####################################################
+键盘sim2sim操控
+# Terminal 1 — MuJoCo simulator (from repo root)
+source .venv_sim/bin/activate
+python gear_sonic/scripts/run_sim_loop.py
+
+# Terminal 2 — C++ deployment (from gear_sonic_deploy/)
+cd ~/hsj/GR00T-WholeBodyControl/gear_sonic_deploy
+source scripts/setup_env.sh
+bash deploy.sh sim --input-type keyboard
+
+
+按 ] 启动控制。
+在 MuJoCo 窗口按 9（如果还没放倒/落地）。
+回 Terminal 2 按 Enter 进入 Planner（看到 Planner enabled）。
+按 1 选 Slow Walk。
+开始移动：
+W 前进
+S 后退
+, / . 左右平移
+A / D 带转向前进
+Q / E 原地调整朝向
+调速度：9 降速，0 升速。
+需要立刻停：R（或 ` / ~）。
+结束：O 急停并退出。
+
+####################################################
+keyboard 模式内部两层状态（sim 和 real 都一样）
+
+1) Normal Mode（默认）
+本质：播放参考动作库。
+常用键：
+] 启动
+T 播放
+N/P 切动作
+R 回首帧
+O 退出
+
+2) Planner Mode（按 Enter 切换）
+本质：实时规划控制（走路/跑步/风格步态）。
+常用键：
+1/2/3（慢走/走/跑）
+WASD
+, / .
+Q / E
+9 / 0
+- / =
+R 急停动量
+
+####################################################
+真机deploy
+Terminal 1:
+cd ~/hsj/GR00T-WholeBodyControl/gear_sonic_deploy
+export TensorRT_ROOT=$HOME/TensorRT
+source scripts/setup_env.sh
+bash deploy.sh real --input-type keyboard
+
+
+Terminal 2:
+cd ~/hsj/GR00T-WholeBodyControl
+source .venv_sim/bin/activate
+cd gear_sonic_deploy
+python visualize_motion.py --realtime_debug_url tcp://192.168.123.164:5557
+
+O紧急停止
+Q / E来调整朝向。
+理论可以通过I重置基准
+
+#######################################################
+Known Issue
+按下]后机器人剧烈旋转跨：这是由于开机时机器人朝向被记录了，每次运行会调整至记录的朝向。
+我已经通过将
+g1_deploy_onnx_ref.cpp
+line 532
+reinitialize_heading_ 从false设定成true来抹除这个行为。
+机器人会以每次程序启动朝向为基准。
+
