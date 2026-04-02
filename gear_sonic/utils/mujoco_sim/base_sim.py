@@ -217,11 +217,13 @@ class DefaultEnv:
             self.viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
             self.viewer.cam.trackbodyid = self.mj_model.body("pelvis").id
 
-        # Build set of actuated joint names (excludes mimic joints)
+        # Build joint_id -> actuator_id mapping (excludes mimic joints)
+        joint_to_actuator = {}
         actuated_joints = set()
         for i in range(self.mj_model.nu):
             jnt_id = self.mj_model.actuator(i).trnid[0]
             if jnt_id >= 0:
+                joint_to_actuator[jnt_id] = i
                 actuated_joints.add(self.mj_model.joint(jnt_id).name)
 
         self.body_joint_index = []
@@ -248,6 +250,16 @@ class DefaultEnv:
         self.body_joint_index = np.array(self.body_joint_index)
         self.left_hand_index = np.array(self.left_hand_index)
         self.right_hand_index = np.array(self.right_hand_index)
+
+        # Build proper qpos/qvel/actuator index arrays for hand joints.
+        # Cannot use joint_index - 1 as actuator index when mimic joints
+        # create gaps between joint IDs and actuator IDs (e.g., Inspire hand).
+        self.left_hand_qpos_adr = np.array([self.mj_model.jnt_qposadr[j] for j in self.left_hand_index])
+        self.left_hand_dof_adr = np.array([self.mj_model.jnt_dofadr[j] for j in self.left_hand_index])
+        self.left_hand_actuator_idx = np.array([joint_to_actuator[j] for j in self.left_hand_index])
+        self.right_hand_qpos_adr = np.array([self.mj_model.jnt_qposadr[j] for j in self.right_hand_index])
+        self.right_hand_dof_adr = np.array([self.mj_model.jnt_dofadr[j] for j in self.right_hand_index])
+        self.right_hand_actuator_idx = np.array([joint_to_actuator[j] for j in self.right_hand_index])
 
     def init_renderers(self):
         self.renderers = {}
@@ -309,12 +321,12 @@ class DefaultEnv:
                     + self.unitree_bridge.left_hand_cmd.motor_cmd[i].kp
                     * (
                         self.unitree_bridge.left_hand_cmd.motor_cmd[i].q
-                        - self.mj_data.qpos[self.left_hand_index[i] + self.qpos_offset - 1]
+                        - self.mj_data.qpos[self.left_hand_qpos_adr[i]]
                     )
                     + self.unitree_bridge.left_hand_cmd.motor_cmd[i].kd
                     * (
                         self.unitree_bridge.left_hand_cmd.motor_cmd[i].dq
-                        - self.mj_data.qvel[self.left_hand_index[i] + self.qvel_offset - 1]
+                        - self.mj_data.qvel[self.left_hand_dof_adr[i]]
                     )
                 )
                 right_hand_torques[i] = (
@@ -322,12 +334,12 @@ class DefaultEnv:
                     + self.unitree_bridge.right_hand_cmd.motor_cmd[i].kp
                     * (
                         self.unitree_bridge.right_hand_cmd.motor_cmd[i].q
-                        - self.mj_data.qpos[self.right_hand_index[i] + self.qpos_offset - 1]
+                        - self.mj_data.qpos[self.right_hand_qpos_adr[i]]
                     )
                     + self.unitree_bridge.right_hand_cmd.motor_cmd[i].kd
                     * (
                         self.unitree_bridge.right_hand_cmd.motor_cmd[i].dq
-                        - self.mj_data.qvel[self.right_hand_index[i] + self.qvel_offset - 1]
+                        - self.mj_data.qvel[self.right_hand_dof_adr[i]]
                     )
                 )
         return np.concatenate((left_hand_torques, right_hand_torques))
@@ -377,14 +389,14 @@ class DefaultEnv:
         obs["body_ddq"] = self.mj_data.qacc[self.body_joint_index + 6 - 1]
         obs["body_tau_est"] = self.mj_data.actuator_force[self.body_joint_index - 1]
         if self.num_hand_dof > 0:
-            obs["left_hand_q"] = self.mj_data.qpos[self.left_hand_index + self.qpos_offset - 1]
-            obs["left_hand_dq"] = self.mj_data.qvel[self.left_hand_index + self.qvel_offset - 1]
-            obs["left_hand_ddq"] = self.mj_data.qacc[self.left_hand_index + self.qvel_offset - 1]
-            obs["left_hand_tau_est"] = self.mj_data.actuator_force[self.left_hand_index - 1]
-            obs["right_hand_q"] = self.mj_data.qpos[self.right_hand_index + self.qpos_offset - 1]
-            obs["right_hand_dq"] = self.mj_data.qvel[self.right_hand_index + self.qvel_offset - 1]
-            obs["right_hand_ddq"] = self.mj_data.qacc[self.right_hand_index + self.qvel_offset - 1]
-            obs["right_hand_tau_est"] = self.mj_data.actuator_force[self.right_hand_index - 1]
+            obs["left_hand_q"] = self.mj_data.qpos[self.left_hand_qpos_adr]
+            obs["left_hand_dq"] = self.mj_data.qvel[self.left_hand_dof_adr]
+            obs["left_hand_ddq"] = self.mj_data.qacc[self.left_hand_dof_adr]
+            obs["left_hand_tau_est"] = self.mj_data.actuator_force[self.left_hand_actuator_idx]
+            obs["right_hand_q"] = self.mj_data.qpos[self.right_hand_qpos_adr]
+            obs["right_hand_dq"] = self.mj_data.qvel[self.right_hand_dof_adr]
+            obs["right_hand_ddq"] = self.mj_data.qacc[self.right_hand_dof_adr]
+            obs["right_hand_tau_est"] = self.mj_data.actuator_force[self.right_hand_actuator_idx]
         obs["time"] = self.mj_data.time
         return obs
 
@@ -419,8 +431,8 @@ class DefaultEnv:
         # -1: actuator array is 0-based while joint indices from the model are 1-based
         self.torques[self.body_joint_index - 1] = body_torques
         if self.num_hand_dof > 0:
-            self.torques[self.left_hand_index - 1] = hand_torques[: self.num_hand_dof]
-            self.torques[self.right_hand_index - 1] = hand_torques[self.num_hand_dof :]
+            self.torques[self.left_hand_actuator_idx] = hand_torques[: self.num_hand_dof]
+            self.torques[self.right_hand_actuator_idx] = hand_torques[self.num_hand_dof :]
 
         self.torques = np.clip(self.torques, -self.torque_limit, self.torque_limit)
 

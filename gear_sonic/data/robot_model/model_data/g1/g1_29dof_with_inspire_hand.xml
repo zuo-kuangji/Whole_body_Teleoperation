@@ -324,7 +324,7 @@
 
                           <!-- ==================== LEFT INSPIRE HAND ==================== -->
                           <!-- L_hand_base_link attached to left_wrist_yaw_link -->
-                          <body name="left_hand_base_link" pos="0.0415 0.003 0">
+                          <body name="left_hand_base_link" pos="0.0415 0.003 0" quat="0.707107 0 0 0.707107">
                             <inertial pos="-0.002551 -0.066047 -0.0019357" mass="0.14143"
                               fullinertia="0.0001234 8.3835E-05 7.7231E-05 2.1995E-06 -1.7694E-06 1.5968E-06" />
                             <geom type="mesh" contype="0" conaffinity="0" group="1" density="0"
@@ -548,7 +548,7 @@
 
                           <!-- ==================== RIGHT INSPIRE HAND ==================== -->
                           <!-- R_hand_base_link attached to right_wrist_yaw_link -->
-                          <body name="right_hand_base_link" pos="0.0415 -0.003 0">
+                          <body name="right_hand_base_link" pos="0.0415 -0.003 0" quat="0.707107 0 0 0.707107">
                             <inertial pos="-0.0025264 -0.066047 0.0019598" mass="0.14143"
                               fullinertia="0.00012281 8.3832E-05 7.6663E-05 2.1711E-06 1.7709E-06 -1.6551E-06" />
                             <geom type="mesh" contype="0" conaffinity="0" group="1" density="0"
