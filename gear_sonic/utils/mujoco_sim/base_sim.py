@@ -217,6 +217,13 @@ class DefaultEnv:
             self.viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
             self.viewer.cam.trackbodyid = self.mj_model.body("pelvis").id
 
+        # Build set of actuated joint names (excludes mimic joints)
+        actuated_joints = set()
+        for i in range(self.mj_model.nu):
+            jnt_id = self.mj_model.actuator(i).trnid[0]
+            if jnt_id >= 0:
+                actuated_joints.add(self.mj_model.joint(jnt_id).name)
+
         self.body_joint_index = []
         self.left_hand_index = []
         self.right_hand_index = []
@@ -229,9 +236,9 @@ class DefaultEnv:
                 ]
             ):
                 self.body_joint_index.append(i)
-            elif "left_hand" in name:
+            elif "left_hand" in name and name in actuated_joints:
                 self.left_hand_index.append(i)
-            elif "right_hand" in name:
+            elif "right_hand" in name and name in actuated_joints:
                 self.right_hand_index.append(i)
 
         assert len(self.body_joint_index) == self.robot.NUM_JOINTS
