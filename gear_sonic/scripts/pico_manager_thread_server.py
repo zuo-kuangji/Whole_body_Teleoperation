@@ -1848,8 +1848,18 @@ def run_pico_manager(
         if InspireHandController is None:
             raise ImportError("InspireHandController not available. Check dex_retargeting installation.")
         from unitree_sdk2py.core.channel import ChannelFactoryInitialize
-        dds_interface = "lo" if hand_sim else ""
-        ChannelFactoryInitialize(0, dds_interface)
+        try:
+            if hand_sim:
+                ChannelFactoryInitialize(0, "lo")
+            else:
+                ChannelFactoryInitialize(0)
+        except Exception as e:
+            print(f"Note: DDS channel init attempt: {e}")
+            # Retry without interface specification
+            try:
+                ChannelFactoryInitialize(0)
+            except Exception:
+                pass
         inspire_controller = InspireHandController(mode="DFX", fps=50.0, sim=hand_sim)
         inspire_controller.start()
         print("[Manager] Inspire hand controller started")
