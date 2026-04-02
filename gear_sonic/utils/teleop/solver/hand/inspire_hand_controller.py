@@ -47,6 +47,11 @@ def _normalize(val, min_val, max_val):
     return np.clip((max_val - val) / (max_val - min_val), 0.0, 1.0)
 
 
+def _denormalize(val, min_val, max_val):
+    """Convert [0, 1] back to radians. Inverse of _normalize."""
+    return max_val - val * (max_val - min_val)
+
+
 def pico_to_openxr_25(pico_state):
     """Convert PICO 27x7 hand state to OpenXR 25x3 positions.
 
@@ -55,6 +60,7 @@ def pico_to_openxr_25(pico_state):
     15-19=Ring, 20-24=Pinky.
     """
     # Take joints 1-25 (skip Palm at 0), positions only
+    pico_state = np.asarray(pico_state)
     positions = pico_state[1:26, :3].copy()
     # Center at wrist (joint 0 in output)
     positions -= positions[0:1, :]
@@ -141,9 +147,10 @@ class InspireHandController:
       - "FTP": Separate topics rt/inspire_hand/ctrl/l and rt/inspire_hand/ctrl/r
     """
 
-    def __init__(self, mode="DFX", fps=50.0):
+    def __init__(self, mode="DFX", fps=50.0, sim=False):
         self.mode = mode
         self.fps = fps
+        self.sim = sim
         self.running = False
         self._thread = None
         self.retargeting = InspireHandRetargeting()
@@ -204,6 +211,7 @@ class InspireHandController:
 
         left_cmd = np.ones(INSPIRE_NUM_MOTORS)  # 1.0 = fully open
         right_cmd = np.ones(INSPIRE_NUM_MOTORS)
+        _print_counter = 0
 
         while self.running:
             t0 = time.time()
@@ -212,7 +220,10 @@ class InspireHandController:
                 left_state = self._left_hand_state
                 right_state = self._right_hand_state
 
-            if left_state is not None and right_state is not None:
+            has_data = left_state is not None and right_state is not None
+            did_retarget = False
+
+            if has_data:
                 left_25 = pico_to_openxr_25(left_state)
                 right_25 = pico_to_openxr_25(right_state)
 
@@ -220,8 +231,17 @@ class InspireHandController:
                 if not (np.all(left_25 == 0) or np.all(right_25 == 0)):
                     try:
                         left_cmd, right_cmd = self.retargeting.retarget(left_25, right_25)
+                        did_retarget = True
                     except Exception as e:
                         print(f"[InspireHand] Retargeting error: {e}")
+
+            # Debug print every 50 ticks (~1s at 50Hz)
+            _print_counter += 1
+            if _print_counter % 50 == 0:
+                if not has_data:
+                    print(f"[InspireHand] No hand tracking data (left={left_state is not None}, right={right_state is not None})")
+                else:
+                    print(f"[InspireHand] retarget={did_retarget} L_cmd={np.round(left_cmd, 2)} R_cmd={np.round(right_cmd, 2)}")
 
             self._send_command(left_cmd, right_cmd)
 
@@ -243,13 +263,22 @@ class InspireHandController:
         msg = MotorCmds_()
         msg.cmds = [unitree_go_msg_dds__MotorCmd_() for _ in range(12)]
 
-        # Right hand: indices 0-5
         for i in range(INSPIRE_NUM_MOTORS):
-            msg.cmds[i].q = float(right_cmd[i])
-
-        # Left hand: indices 6-11
-        for i in range(INSPIRE_NUM_MOTORS):
-            msg.cmds[6 + i].q = float(left_cmd[i])
+            # Right hand: indices 0-5, Left hand: indices 6-11
+            if self.sim:
+                # Sim needs radians + PD gains for torque computation
+                r_rad = _denormalize(float(right_cmd[i]), *JOINT_RANGES[i])
+                l_rad = _denormalize(float(left_cmd[i]), *JOINT_RANGES[i])
+                msg.cmds[i].q = r_rad
+                msg.cmds[i].kp = 4.0
+                msg.cmds[i].kd = 0.2
+                msg.cmds[6 + i].q = l_rad
+                msg.cmds[6 + i].kp = 4.0
+                msg.cmds[6 + i].kd = 0.2
+            else:
+                # Real robot: normalized [0,1] values
+                msg.cmds[i].q = float(right_cmd[i])
+                msg.cmds[6 + i].q = float(left_cmd[i])
 
         self._pub.Write(msg)
 
