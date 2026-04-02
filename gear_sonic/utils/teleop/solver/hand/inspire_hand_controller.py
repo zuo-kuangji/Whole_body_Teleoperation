@@ -67,7 +67,7 @@ class InspireHandRetargeting:
     def __init__(self, config_path=None):
         if config_path is None:
             config_path = (
-                Path(__file__).resolve().parent.parent.parent.parent
+                Path(__file__).resolve().parent.parent.parent.parent.parent
                 / "data" / "robot_model" / "model_data" / "g1"
                 / "inspire_hand" / "inspire_hand.yml"
             )
