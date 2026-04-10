@@ -161,6 +161,15 @@ class UnitreeSdk2Bridge:
         }
         self.joystick = None
 
+        # Inspire hand debug logging (throttled to avoid flooding the terminal)
+        self.inspire_debug_counter = 0
+        self.inspire_debug_every = 50
+        # Incoming Inspire DDS order is hardware-centric:
+        #   [pinky, ring, middle, index, thumb_pitch, thumb_yaw]
+        # MuJoCo hand joints/actuators are ordered as:
+        #   [thumb_yaw, thumb_pitch, index, middle, ring, pinky]
+        self.inspire_to_mj_order = [5, 4, 3, 2, 1, 0]
+
         self.reset()
 
     def reset(self):
@@ -199,19 +208,88 @@ class UnitreeSdk2Bridge:
         """Handler for rt/inspire/cmd (MotorCmds_ with 12 motors: right=0-5, left=6-11)."""
         with self.inspire_hand_cmd_lock:
             self.inspire_hand_cmd = msg
-            # Map Inspire cmds into left/right HandCmd-compatible structures via .q
+            # Map Inspire commands into MuJoCo hand order and preserve the full PD command.
             with self.right_hand_cmd_lock:
                 for i in range(self.num_hand_motor):
-                    self.right_hand_cmd.motor_cmd[i].q = msg.cmds[i].q
+                    src_idx = self.inspire_to_mj_order[i]
+                    src = msg.cmds[src_idx]
+                    dst = self.right_hand_cmd.motor_cmd[i]
+                    dst.mode = src.mode
+                    dst.q = src.q
+                    dst.dq = src.dq
+                    dst.tau = src.tau
+                    dst.kp = src.kp
+                    dst.kd = src.kd
                 self.right_hand_cmd_received = True
                 self.new_right_hand_cmd = True
             with self.left_hand_cmd_lock:
                 for i in range(self.num_hand_motor):
-                    self.left_hand_cmd.motor_cmd[i].q = msg.cmds[6 + i].q
+                    src_idx = 6 + self.inspire_to_mj_order[i]
+                    src = msg.cmds[src_idx]
+                    dst = self.left_hand_cmd.motor_cmd[i]
+                    dst.mode = src.mode
+                    dst.q = src.q
+                    dst.dq = src.dq
+                    dst.tau = src.tau
+                    dst.kp = src.kp
+                    dst.kd = src.kd
                 self.left_hand_cmd_received = True
                 self.new_left_hand_cmd = True
             self.inspire_hand_cmd_received = True
             self.new_inspire_hand_cmd = True
+
+            self.inspire_debug_counter += 1
+            if self.inspire_debug_counter % self.inspire_debug_every == 0:
+                right_in_q = np.array([msg.cmds[i].q for i in range(self.num_hand_motor)], dtype=np.float64)
+                right_in_kp = np.array([msg.cmds[i].kp for i in range(self.num_hand_motor)], dtype=np.float64)
+                right_in_kd = np.array([msg.cmds[i].kd for i in range(self.num_hand_motor)], dtype=np.float64)
+                left_in_q = np.array(
+                    [msg.cmds[6 + i].q for i in range(self.num_hand_motor)], dtype=np.float64
+                )
+                left_in_kp = np.array(
+                    [msg.cmds[6 + i].kp for i in range(self.num_hand_motor)], dtype=np.float64
+                )
+                left_in_kd = np.array(
+                    [msg.cmds[6 + i].kd for i in range(self.num_hand_motor)], dtype=np.float64
+                )
+                right_mapped_q = np.array(
+                    [self.right_hand_cmd.motor_cmd[i].q for i in range(self.num_hand_motor)],
+                    dtype=np.float64,
+                )
+                right_mapped_kp = np.array(
+                    [self.right_hand_cmd.motor_cmd[i].kp for i in range(self.num_hand_motor)],
+                    dtype=np.float64,
+                )
+                right_mapped_kd = np.array(
+                    [self.right_hand_cmd.motor_cmd[i].kd for i in range(self.num_hand_motor)],
+                    dtype=np.float64,
+                )
+                left_mapped_q = np.array(
+                    [self.left_hand_cmd.motor_cmd[i].q for i in range(self.num_hand_motor)],
+                    dtype=np.float64,
+                )
+                left_mapped_kp = np.array(
+                    [self.left_hand_cmd.motor_cmd[i].kp for i in range(self.num_hand_motor)],
+                    dtype=np.float64,
+                )
+                left_mapped_kd = np.array(
+                    [self.left_hand_cmd.motor_cmd[i].kd for i in range(self.num_hand_motor)],
+                    dtype=np.float64,
+                )
+                print(
+                    "[BridgeHand] incoming "
+                    f"R_q={np.round(right_in_q, 3)} R_kp={np.round(right_in_kp, 3)} "
+                    f"R_kd={np.round(right_in_kd, 3)} "
+                    f"L_q={np.round(left_in_q, 3)} L_kp={np.round(left_in_kp, 3)} "
+                    f"L_kd={np.round(left_in_kd, 3)}"
+                )
+                print(
+                    "[BridgeHand] mapped   "
+                    f"R_q={np.round(right_mapped_q, 3)} R_kp={np.round(right_mapped_kp, 3)} "
+                    f"R_kd={np.round(right_mapped_kd, 3)} "
+                    f"L_q={np.round(left_mapped_q, 3)} L_kp={np.round(left_mapped_kp, 3)} "
+                    f"L_kd={np.round(left_mapped_kd, 3)}"
+                )
 
     def cmd_received(self):
         with self.low_cmd_lock:

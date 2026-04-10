@@ -1,8 +1,9 @@
 """Inspire dexterous hand controller for PICO VR hand tracking.
 
-Reads PICO hand tracking (27 joints per hand), converts to 25-joint OpenXR
-format, runs DexPilot retargeting to get 6-DOF joint angles, and sends
-commands to Inspire hands via Unitree DDS.
+Reads PICO hand tracking, converts the XRoboToolkit palm-first 26-joint hand
+layout into the wrist-first 25-joint format expected by the upstream
+retargeting pipeline, runs DexPilot retargeting to get 6-DOF joint angles, and
+sends commands to Inspire hands via Unitree DDS.
 
 Usage:
     controller = InspireHandController(mode="DFX")
@@ -20,15 +21,46 @@ from pathlib import Path
 
 import numpy as np
 
+from gear_sonic.utils.teleop.solver.hand.inspire_hand_mapping import (
+    remap_normalized_hand_command,
+    xrt_hand_state_to_unitree_hand_positions,
+)
+from gear_sonic.utils.teleop.solver.hand.inspire_hand_sources import (
+    XR_TELEOP_ROOT,
+    XR_TELEOP_TELEOP_DIR,
+    choose_inspire_config_path,
+    prepend_sys_path,
+    temporary_workdir,
+)
+
 # Add dex-retargeting to path (from xr_teleoperate)
 _DEX_RETARGET_PATH = "/home/g1/zuo/xr_teleoperate/teleop/robot_control/dex-retargeting/src"
-if _DEX_RETARGET_PATH not in sys.path:
-    sys.path.insert(0, _DEX_RETARGET_PATH)
+prepend_sys_path(XR_TELEOP_ROOT)
+prepend_sys_path(Path(_DEX_RETARGET_PATH))
 
 from dex_retargeting.retargeting_config import RetargetingConfig
 
+try:
+    from teleop.robot_control.hand_retargeting import HandRetargeting as UpstreamHandRetargeting
+    from teleop.robot_control.hand_retargeting import HandType as UpstreamHandType
+except ImportError:
+    UpstreamHandRetargeting = None
+    UpstreamHandType = None
+
 # Inspire hand has 6 actuated DOF per hand
 INSPIRE_NUM_MOTORS = 6
+FINGER_COMMAND_NAMES = [
+    "pinky",
+    "ring",
+    "middle",
+    "index",
+    "thumb_pitch",
+    "thumb_yaw",
+]
+OPENXR_TIP_NAMES = ["thumb_tip", "index_tip", "middle_tip", "ring_tip", "pinky_tip"]
+OPENXR_TIP_INDICES = [4, 9, 14, 19, 24]
+XRT_TIP_INDICES = [5, 10, 15, 20, 25]
+XRT_WRIST_INDEX = 1
 
 # Joint normalization ranges (radians) — from xr_teleoperate
 # Order after hardware reorder: [pinky, ring, middle, index, thumb_pitch, thumb_yaw]
@@ -52,31 +84,49 @@ def _denormalize(val, min_val, max_val):
     return max_val - val * (max_val - min_val)
 
 
-def pico_to_openxr_25(pico_state):
-    """Convert PICO 27x7 hand state to OpenXR 25x3 positions.
+def pico_to_openxr_25(pico_state, arm_pose=None):
+    """Convert XRoboToolkit hand state to 25x3 retargeting positions.
 
-    PICO joints 0=Palm, 1=Wrist, 2-25=finger joints, 26=extra.
-    OpenXR 25 joints: 0=Wrist, 1-4=Thumb, 5-9=Index, 10-14=Middle,
-    15-19=Ring, 20-24=Pinky.
+    XRoboToolkit hand tracking is palm-first (0=palm, 1=wrist, 2..25 fingers),
+    so the conversion drops the palm and keeps joints 1..25 in wrist-first
+    order.
     """
-    # Take joints 1-25 (skip Palm at 0), positions only
-    pico_state = np.asarray(pico_state)
-    positions = pico_state[1:26, :3].copy()
-    # Center at wrist (joint 0 in output)
-    positions -= positions[0:1, :]
-    return positions
+    return xrt_hand_state_to_unitree_hand_positions(pico_state, arm_pose=arm_pose)
 
 
 class InspireHandRetargeting:
     """Wrapper around dex_retargeting for Inspire hands."""
 
     def __init__(self, config_path=None):
+        self.source = "local"
+        self.config_path = None
+        self.upstream_error = None
+
+        if config_path is None and UpstreamHandRetargeting is not None and UpstreamHandType is not None:
+            try:
+                with temporary_workdir(XR_TELEOP_TELEOP_DIR):
+                    upstream = UpstreamHandRetargeting(UpstreamHandType.INSPIRE_HAND)
+
+                self.left_retargeting = upstream.left_retargeting
+                self.right_retargeting = upstream.right_retargeting
+                self.left_joint_names = upstream.left_retargeting_joint_names
+                self.right_joint_names = upstream.right_retargeting_joint_names
+                self.left_indices = upstream.left_indices
+                self.right_indices = upstream.right_indices
+                self.left_reorder = upstream.left_dex_retargeting_to_hardware
+                self.right_reorder = upstream.right_dex_retargeting_to_hardware
+                self.config_path = choose_inspire_config_path()
+                self.source = "xr_teleoperate"
+                return
+            except Exception as exc:
+                self.upstream_error = exc
+
         if config_path is None:
-            config_path = (
-                Path(__file__).resolve().parent.parent.parent.parent.parent
-                / "data" / "robot_model" / "model_data" / "g1"
-                / "inspire_hand" / "inspire_hand.yml"
-            )
+            config_path = choose_inspire_config_path()
+        else:
+            config_path = Path(config_path)
+
+        self.config_path = config_path
 
         import yaml
         with open(config_path, "r") as f:
@@ -154,10 +204,21 @@ class InspireHandController:
         self.running = False
         self._thread = None
         self.retargeting = InspireHandRetargeting()
+        print(
+            "[InspireHand] Retargeting source:"
+            f" {self.retargeting.source} ({self.retargeting.config_path})"
+        )
+        if self.retargeting.upstream_error is not None:
+            print(
+                "[InspireHand] Upstream HandRetargeting unavailable, using local fallback:"
+                f" {self.retargeting.upstream_error}"
+            )
 
         # Latest hand tracking data (set by update())
         self._left_hand_state = None
         self._right_hand_state = None
+        self._left_arm_pose = None
+        self._right_arm_pose = None
         self._lock = threading.Lock()
 
         # DDS publishers (initialized in start())
@@ -183,11 +244,13 @@ class InspireHandController:
 
         self._publishers_initialized = True
 
-    def update(self, left_pico_state, right_pico_state):
-        """Feed new PICO hand tracking data (27x7 arrays or None)."""
+    def update(self, left_pico_state, right_pico_state, left_arm_pose=None, right_arm_pose=None):
+        """Feed new hand tracking data (26x7 arrays or None)."""
         with self._lock:
             self._left_hand_state = left_pico_state
             self._right_hand_state = right_pico_state
+            self._left_arm_pose = left_arm_pose
+            self._right_arm_pose = right_arm_pose
 
     def start(self):
         """Start the background control thread."""
@@ -211,6 +274,10 @@ class InspireHandController:
 
         left_cmd = np.ones(INSPIRE_NUM_MOTORS)  # 1.0 = fully open
         right_cmd = np.ones(INSPIRE_NUM_MOTORS)
+        left_raw_cmd = left_cmd.copy()
+        right_raw_cmd = right_cmd.copy()
+        left_25 = None
+        right_25 = None
         _print_counter = 0
 
         while self.running:
@@ -219,18 +286,22 @@ class InspireHandController:
             with self._lock:
                 left_state = self._left_hand_state
                 right_state = self._right_hand_state
+                left_arm_pose = self._left_arm_pose
+                right_arm_pose = self._right_arm_pose
 
             has_data = left_state is not None and right_state is not None
             did_retarget = False
 
             if has_data:
-                left_25 = pico_to_openxr_25(left_state)
-                right_25 = pico_to_openxr_25(right_state)
+                left_25 = pico_to_openxr_25(left_state, arm_pose=left_arm_pose)
+                right_25 = pico_to_openxr_25(right_state, arm_pose=right_arm_pose)
 
                 # Skip if data looks uninitialized
                 if not (np.all(left_25 == 0) or np.all(right_25 == 0)):
                     try:
-                        left_cmd, right_cmd = self.retargeting.retarget(left_25, right_25)
+                        left_raw_cmd, right_raw_cmd = self.retargeting.retarget(left_25, right_25)
+                        left_cmd = remap_normalized_hand_command(left_raw_cmd)
+                        right_cmd = remap_normalized_hand_command(right_raw_cmd)
                         did_retarget = True
                     except Exception as e:
                         print(f"[InspireHand] Retargeting error: {e}")
@@ -241,7 +312,39 @@ class InspireHandController:
                 if not has_data:
                     print(f"[InspireHand] No hand tracking data (left={left_state is not None}, right={right_state is not None})")
                 else:
-                    print(f"[InspireHand] retarget={did_retarget} L_cmd={np.round(left_cmd, 2)} R_cmd={np.round(right_cmd, 2)}")
+                    print(f"[InspireHand] retarget={did_retarget} L_cmd={np.round(left_cmd, 2)}")
+                    if did_retarget and left_25 is not None and right_25 is not None:
+                        left_state_tip_norms = None
+                        if left_state is not None:
+                            left_state_arr = np.asarray(left_state, dtype=np.float64)
+                            if left_state_arr.ndim == 2 and left_state_arr.shape[0] >= 26 and left_state_arr.shape[1] >= 3:
+                                left_state_tip_norms = np.linalg.norm(
+                                    left_state_arr[XRT_TIP_INDICES, :3]
+                                    - left_state_arr[XRT_WRIST_INDEX:XRT_WRIST_INDEX + 1, :3],
+                                    axis=1,
+                                )
+                        left_tip_norms = np.linalg.norm(left_25[OPENXR_TIP_INDICES], axis=1)
+                        right_tip_norms = np.linalg.norm(right_25[OPENXR_TIP_INDICES], axis=1)
+                        if left_state_tip_norms is not None:
+                            print(
+                                "[InspireHand] xrt_tip_dists "
+                                f"L={dict(zip(OPENXR_TIP_NAMES, np.round(left_state_tip_norms, 3)))} "
+                            )
+                        print(
+                            "[InspireHand] raw_named "
+                            f"L={dict(zip(FINGER_COMMAND_NAMES, np.round(left_raw_cmd, 3)))} "
+                            # f"R={dict(zip(FINGER_COMMAND_NAMES, np.round(right_raw_cmd, 3)))}"
+                        )
+                        print(
+                            "[InspireHand] remap_named "
+                            f"L={dict(zip(FINGER_COMMAND_NAMES, np.round(left_cmd, 3)))} "
+                            # f"R={dict(zip(FINGER_COMMAND_NAMES, np.round(right_cmd, 3)))}"
+                        )
+                        print(
+                            "[InspireHand] tip_norms "
+                            f"L={dict(zip(OPENXR_TIP_NAMES, np.round(left_tip_norms, 3)))} "
+                            # f"R={dict(zip(OPENXR_TIP_NAMES, np.round(right_tip_norms, 3)))}"
+                        )
 
             self._send_command(left_cmd, right_cmd)
 

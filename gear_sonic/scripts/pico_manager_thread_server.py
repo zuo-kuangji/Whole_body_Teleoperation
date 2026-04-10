@@ -36,6 +36,7 @@ import torch
 import zmq
 
 from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
+
 from gear_sonic.trl.utils.rotation_conversion import decompose_rotation_aa
 from gear_sonic.trl.utils.torch_transform import (
     angle_axis_to_quaternion,
@@ -1824,6 +1825,7 @@ def run_pico_manager(
     enable_smpl_vis: bool = False,
     hand_type: str = "dex3",
     hand_sim: bool = False,
+    # auto_pose_delay: float | None = None,
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -1951,6 +1953,11 @@ def run_pico_manager(
                     left_ht = xrt.get_left_hand_tracking_state() if left_active else None
                     right_ht = xrt.get_right_hand_tracking_state() if right_active else None
                     if left_ht is not None and right_ht is not None:
+                        # XRoboToolkit exposes controller poses, not the dedicated arm-frame
+                        # used by the upstream Quest/WebXR teleop stack. Passing controller
+                        # poses here distorts the retargeting input more than helping, so keep
+                        # the hand preprocessing in the wrist-local path unless a real arm pose
+                        # source becomes available.
                         inspire_controller.update(left_ht, right_ht)
                 except Exception as e:
                     print(f"[Manager] Hand tracking error: {e}")
@@ -1963,6 +1970,7 @@ def run_pico_manager(
 
             # Rising edge: A+B+X+Y pressed together -> toggle policy start/stop (planner=True)
             start_combo = (a_pressed) and (b_pressed) and (x_pressed) and (y_pressed)
+
 
             new_mode = current_mode
             if current_mode == StreamMode.OFF:
@@ -2194,6 +2202,12 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable sim mode for Inspire hand (sends radians + PD gains instead of normalized values)",
     )
+    parser.add_argument(
+        "--auto-pose-delay",
+        type=float,
+        default=None,
+        help="Automatically enter POSE after this many seconds in manager mode (default: disabled)",
+    )
     args = parser.parse_args()
 
     # Standalone VR3Pt test modes (exit after finishing)
@@ -2236,6 +2250,7 @@ if __name__ == "__main__":
             enable_smpl_vis=args.vis_smpl,
             hand_type=args.hand_type,
             hand_sim=args.hand_sim,
+            # auto_pose_delay=args.auto_pose_delay,
         )
     else:
         # Run legacy single-thread pose streaming

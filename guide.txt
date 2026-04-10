@@ -80,3 +80,44 @@ line 532
 reinitialize_heading_ 从false设定成true来抹除这个行为。
 机器人会以每次程序启动朝向为基准。
 
+
+cd /home/g1/zuo/inspire_hand_ws/inspire_hand_sdk
+pip install -e .
+
+dex_retargeting           0.4.7             /home/g1/zuo/xr_teleoperate/teleop/robot_control/dex-retargeting
+# 安装 dex-retargeting 模块
+(tv) unitree@Host:~/xr_teleoperate/teleop/televuer$ cd ../robot_control/dex-retargeting/
+(tv) unitree@Host:~/xr_teleoperate/teleop/robot_control/dex-retargeting$ pip install -e .
+# 安装本仓库所需的其他依赖库
+(tv) unitree@Host:~/xr_teleoperate/teleop/robot_control/dex-retargeting$ cd ../../../
+(tv) unitree@Host:~/xr_teleoperate$ pip install -r requirements.txt
+
+#####################################################
+仿真模式（Inspire 手）— 3 个 Terminal
+
+# Terminal 1 — MuJoCo 仿真器
+source .venv_teleop/bin/activate
+python gear_sonic/scripts/run_sim_loop.py --wbc-version sonic_model12_inspire
+
+# Terminal 2 — C++ 部署（全身控制）
+cd gear_sonic_deploy
+source scripts/setup_env.sh
+bash deploy.sh --input-type zmq_manager sim
+
+# Terminal 3 — PICO 遥操（全身 + Inspire 手）
+source .venv_teleop/bin/activate
+python gear_sonic/scripts/pico_manager_thread_server.py \
+    --manager --hand-type inspire --hand-sim
+
+
+真机模式（Inspire 手）— 2 个 Terminal
+
+# Terminal 1 — C++ 部署（全身控制）
+cd gear_sonic_deploy
+source scripts/setup_env.sh
+bash deploy.sh --input-type zmq_manager real
+
+# Terminal 2 — PICO 遥操（全身 + Inspire 手）
+source .venv_teleop/bin/activate
+python gear_sonic/scripts/pico_manager_thread_server.py \
+    --manager --hand-type inspire

@@ -604,13 +604,22 @@ def quaternion_multiply_np(a, b):
 
 def decompose_rotation_aa(rotation_aa, v2):
     angle = np.linalg.norm(rotation_aa, axis=1)[:, None]
+    small_angle = angle < 1e-8
     w = np.cos(angle / 2)
-    v = np.sin(angle / 2) * rotation_aa / angle
+    scale = np.empty_like(angle)
+    scale[small_angle] = 0.5
+    scale[~small_angle] = np.sin(angle[~small_angle] / 2) / angle[~small_angle]
+    v = rotation_aa * scale
     q = np.concatenate([w, v], axis=1)
 
     v_twist = np.dot(v, v2)[:, None] * v2
     q_twist = np.concatenate([w, v_twist], axis=1)
-    q_twist = q_twist / np.linalg.norm(q_twist, axis=1)[:, None]
+    q_twist_norm = np.linalg.norm(q_twist, axis=1)[:, None]
+    nonzero_q_twist = q_twist_norm >= 1e-8
+    q_twist[nonzero_q_twist[:, 0]] = (
+        q_twist[nonzero_q_twist[:, 0]] / q_twist_norm[nonzero_q_twist[:, 0]]
+    )
+    q_twist[~nonzero_q_twist[:, 0]] = np.array([1.0, 0.0, 0.0, 0.0])
 
     q_twist_inv = q_twist * np.array([1, -1, -1, -1])
     q_swing = quaternion_multiply_np(q_twist_inv, q)

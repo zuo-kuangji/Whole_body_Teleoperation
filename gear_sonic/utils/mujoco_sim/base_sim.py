@@ -250,6 +250,7 @@ class DefaultEnv:
         self.body_joint_index = np.array(self.body_joint_index)
         self.left_hand_index = np.array(self.left_hand_index)
         self.right_hand_index = np.array(self.right_hand_index)
+        self.body_actuator_idx = np.array([joint_to_actuator[j] for j in self.body_joint_index])
 
         # Build proper qpos/qvel/actuator index arrays for hand joints.
         # Cannot use joint_index - 1 as actuator index when mimic joints
@@ -260,6 +261,10 @@ class DefaultEnv:
         self.right_hand_qpos_adr = np.array([self.mj_model.jnt_qposadr[j] for j in self.right_hand_index])
         self.right_hand_dof_adr = np.array([self.mj_model.jnt_dofadr[j] for j in self.right_hand_index])
         self.right_hand_actuator_idx = np.array([joint_to_actuator[j] for j in self.right_hand_index])
+
+        # Hand debug logging (throttled to keep output readable during sim)
+        self.hand_debug_counter = 0
+        self.hand_debug_every = 50
 
     def init_renderers(self):
         self.renderers = {}
@@ -342,6 +347,47 @@ class DefaultEnv:
                         - self.mj_data.qvel[self.right_hand_dof_adr[i]]
                     )
                 )
+        if self.num_hand_dof > 0:
+            self.hand_debug_counter += 1
+            if self.hand_debug_counter % self.hand_debug_every == 0:
+                left_cmd_q = np.array(
+                    [self.unitree_bridge.left_hand_cmd.motor_cmd[i].q for i in range(self.num_hand_dof)],
+                    dtype=np.float64,
+                )
+                left_cmd_kp = np.array(
+                    [self.unitree_bridge.left_hand_cmd.motor_cmd[i].kp for i in range(self.num_hand_dof)],
+                    dtype=np.float64,
+                )
+                left_cmd_kd = np.array(
+                    [self.unitree_bridge.left_hand_cmd.motor_cmd[i].kd for i in range(self.num_hand_dof)],
+                    dtype=np.float64,
+                )
+                right_cmd_q = np.array(
+                    [self.unitree_bridge.right_hand_cmd.motor_cmd[i].q for i in range(self.num_hand_dof)],
+                    dtype=np.float64,
+                )
+                right_cmd_kp = np.array(
+                    [self.unitree_bridge.right_hand_cmd.motor_cmd[i].kp for i in range(self.num_hand_dof)],
+                    dtype=np.float64,
+                )
+                right_cmd_kd = np.array(
+                    [self.unitree_bridge.right_hand_cmd.motor_cmd[i].kd for i in range(self.num_hand_dof)],
+                    dtype=np.float64,
+                )
+                left_meas_q = self.mj_data.qpos[self.left_hand_qpos_adr]
+                right_meas_q = self.mj_data.qpos[self.right_hand_qpos_adr]
+                print(
+                    "[SimHand] cmd "
+                    f"L_q={np.round(left_cmd_q, 3)} L_kp={np.round(left_cmd_kp, 3)} "
+                    f"L_kd={np.round(left_cmd_kd, 3)} "
+                    f"R_q={np.round(right_cmd_q, 3)} R_kp={np.round(right_cmd_kp, 3)} "
+                    f"R_kd={np.round(right_cmd_kd, 3)}"
+                )
+                print(
+                    "[SimHand] state "
+                    f"L_meas={np.round(left_meas_q, 3)} L_tau={np.round(left_hand_torques, 3)} "
+                    f"R_meas={np.round(right_meas_q, 3)} R_tau={np.round(right_hand_torques, 3)}"
+                )
         return np.concatenate((left_hand_torques, right_hand_torques))
 
     def compute_body_qpos(self) -> np.ndarray:
@@ -387,7 +433,7 @@ class DefaultEnv:
         obs["body_q"] = self.mj_data.qpos[self.body_joint_index + 7 - 1]
         obs["body_dq"] = self.mj_data.qvel[self.body_joint_index + 6 - 1]
         obs["body_ddq"] = self.mj_data.qacc[self.body_joint_index + 6 - 1]
-        obs["body_tau_est"] = self.mj_data.actuator_force[self.body_joint_index - 1]
+        obs["body_tau_est"] = self.mj_data.actuator_force[self.body_actuator_idx]
         if self.num_hand_dof > 0:
             obs["left_hand_q"] = self.mj_data.qpos[self.left_hand_qpos_adr]
             obs["left_hand_dq"] = self.mj_data.qvel[self.left_hand_dof_adr]
@@ -428,8 +474,7 @@ class DefaultEnv:
                 self.mj_data.xfrc_applied[self.band_attached_link] = np.zeros(6)
         body_torques = self.compute_body_torques()
         hand_torques = self.compute_hand_torques()
-        # -1: actuator array is 0-based while joint indices from the model are 1-based
-        self.torques[self.body_joint_index - 1] = body_torques
+        self.torques[self.body_actuator_idx] = body_torques
         if self.num_hand_dof > 0:
             self.torques[self.left_hand_actuator_idx] = hand_torques[: self.num_hand_dof]
             self.torques[self.right_hand_actuator_idx] = hand_torques[self.num_hand_dof :]
