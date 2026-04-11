@@ -88,16 +88,24 @@ except ImportError:
 try:
     from gear_sonic.utils.teleop.solver.hand.inspire_hand_controller import (
         InspireHandController,
+        get_inspire_hand_transport_mode,
     )
 except ImportError:
     print("Warning: InspireHandController not available.")
     InspireHandController = None
+    get_inspire_hand_transport_mode = None
 
 try:
     from gear_sonic.utils.teleop.vis.vr3pt_pose_visualizer import VR3PtPoseVisualizer
 except ImportError:
     print("Warning: VR3PtPoseVisualizer not available (pyvista may not be installed).")
     VR3PtPoseVisualizer = None
+
+try:
+    from gear_sonic.utils.teleop.vis.raw_hand_visualizer import RawHandPoseVisualizer
+except ImportError:
+    print("Warning: RawHandPoseVisualizer not available (pyvista may not be installed).")
+    RawHandPoseVisualizer = None
 
 try:
     from gear_sonic.utils.teleop.vis.vr3pt_pose_visualizer import get_g1_key_frame_poses
@@ -1820,6 +1828,7 @@ def run_pico_manager(
     zmq_feedback_host: str = "localhost",
     zmq_feedback_port: int = 5557,
     enable_vis_vr3pt: bool = False,
+    enable_vis_raw_hand: bool = False,
     with_g1_robot: bool = True,
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
@@ -1862,9 +1871,24 @@ def run_pico_manager(
                 ChannelFactoryInitialize(0)
             except Exception:
                 pass
-        inspire_controller = InspireHandController(mode="DFX", fps=50.0, sim=hand_sim)
+        inspire_controller = InspireHandController(
+            mode=get_inspire_hand_transport_mode(hand_sim=hand_sim),
+            fps=50.0,
+            sim=hand_sim,
+        )
         inspire_controller.start()
         print("[Manager] Inspire hand controller started")
+
+    raw_hand_visualizer = None
+    if enable_vis_raw_hand:
+        if RawHandPoseVisualizer is None:
+            raise ImportError(
+                "RawHandPoseVisualizer could not be imported but --vis_raw_hand was requested. "
+                "Install pyvista/vtk to enable the raw hand viewer."
+            )
+        raw_hand_visualizer = RawHandPoseVisualizer(left_only=True, wrist_local=True)
+        raw_hand_visualizer.create_realtime_plotter()
+        print("[Manager] Raw hand visualizer started (left hand, wrist-local view)")
 
     context = zmq.Context()
     socket = context.socket(zmq.PUB)
@@ -1946,13 +1970,20 @@ def run_pico_manager(
             left_axis_click, _ = get_axis_clicks()
 
             # Feed PICO hand tracking to Inspire controller
-            if inspire_controller is not None:
+            if inspire_controller is not None or raw_hand_visualizer is not None:
                 try:
                     left_active = xrt.get_left_hand_is_active()
                     right_active = xrt.get_right_hand_is_active()
                     left_ht = xrt.get_left_hand_tracking_state() if left_active else None
                     right_ht = xrt.get_right_hand_tracking_state() if right_active else None
-                    if left_ht is not None and right_ht is not None:
+                    if raw_hand_visualizer is not None and raw_hand_visualizer.is_open:
+                        raw_hand_visualizer.update_hands(left_ht, right_ht)
+                        raw_hand_visualizer.render()
+                    if (
+                        inspire_controller is not None
+                        and left_ht is not None
+                        and right_ht is not None
+                    ):
                         # XRoboToolkit exposes controller poses, not the dedicated arm-frame
                         # used by the upstream Quest/WebXR teleop stack. Passing controller
                         # poses here distorts the retargeting input more than helping, so keep
@@ -2099,6 +2130,8 @@ def run_pico_manager(
         # Cleanup resources
         reader.stop()
         three_point.close()
+        if raw_hand_visualizer is not None:
+            raw_hand_visualizer.close()
         if inspire_controller is not None:
             inspire_controller.stop()
         socket.close()
@@ -2168,6 +2201,11 @@ if __name__ == "__main__":
         "--vis_vr3pt",
         action="store_true",
         help="Enable inline VR 3-point pose visualization in pose streaming mode",
+    )
+    parser.add_argument(
+        "--vis_raw_hand",
+        action="store_true",
+        help="Enable a separate raw XRoboToolkit hand-skeleton viewer window in manager mode",
     )
     parser.add_argument(
         "--vr3pt_hz",
@@ -2245,6 +2283,7 @@ if __name__ == "__main__":
             zmq_feedback_host=args.zmq_feedback_host,
             zmq_feedback_port=args.zmq_feedback_port,
             enable_vis_vr3pt=args.vis_vr3pt,
+            enable_vis_raw_hand=args.vis_raw_hand,
             with_g1_robot=with_g1_robot,
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,

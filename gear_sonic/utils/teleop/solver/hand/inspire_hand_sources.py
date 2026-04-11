@@ -12,6 +12,7 @@ XR_TELEOP_ROOT = Path("/home/g1/zuo/xr_teleoperate")
 XR_TELEOP_TELEOP_DIR = XR_TELEOP_ROOT / "teleop"
 XR_TELEOP_ROBOT_CONTROL_DIR = XR_TELEOP_ROOT / "teleop" / "robot_control"
 XR_TELEOP_INSPIRE_CONFIG = XR_TELEOP_ROOT / "assets" / "inspire_hand" / "inspire_hand.yml"
+INSPIRE_HAND_SDK_ROOT = Path("/home/g1/hsj/inspire_hand_ws/inspire_hand_sdk/inspire_sdkpy")
 
 
 def get_local_inspire_config_path() -> Path:

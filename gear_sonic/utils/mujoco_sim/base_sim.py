@@ -262,10 +262,6 @@ class DefaultEnv:
         self.right_hand_dof_adr = np.array([self.mj_model.jnt_dofadr[j] for j in self.right_hand_index])
         self.right_hand_actuator_idx = np.array([joint_to_actuator[j] for j in self.right_hand_index])
 
-        # Hand debug logging (throttled to keep output readable during sim)
-        self.hand_debug_counter = 0
-        self.hand_debug_every = 50
-
     def init_renderers(self):
         self.renderers = {}
         for camera_name, camera_config in self.camera_configs.items():
@@ -346,47 +342,6 @@ class DefaultEnv:
                         self.unitree_bridge.right_hand_cmd.motor_cmd[i].dq
                         - self.mj_data.qvel[self.right_hand_dof_adr[i]]
                     )
-                )
-        if self.num_hand_dof > 0:
-            self.hand_debug_counter += 1
-            if self.hand_debug_counter % self.hand_debug_every == 0:
-                left_cmd_q = np.array(
-                    [self.unitree_bridge.left_hand_cmd.motor_cmd[i].q for i in range(self.num_hand_dof)],
-                    dtype=np.float64,
-                )
-                left_cmd_kp = np.array(
-                    [self.unitree_bridge.left_hand_cmd.motor_cmd[i].kp for i in range(self.num_hand_dof)],
-                    dtype=np.float64,
-                )
-                left_cmd_kd = np.array(
-                    [self.unitree_bridge.left_hand_cmd.motor_cmd[i].kd for i in range(self.num_hand_dof)],
-                    dtype=np.float64,
-                )
-                right_cmd_q = np.array(
-                    [self.unitree_bridge.right_hand_cmd.motor_cmd[i].q for i in range(self.num_hand_dof)],
-                    dtype=np.float64,
-                )
-                right_cmd_kp = np.array(
-                    [self.unitree_bridge.right_hand_cmd.motor_cmd[i].kp for i in range(self.num_hand_dof)],
-                    dtype=np.float64,
-                )
-                right_cmd_kd = np.array(
-                    [self.unitree_bridge.right_hand_cmd.motor_cmd[i].kd for i in range(self.num_hand_dof)],
-                    dtype=np.float64,
-                )
-                left_meas_q = self.mj_data.qpos[self.left_hand_qpos_adr]
-                right_meas_q = self.mj_data.qpos[self.right_hand_qpos_adr]
-                print(
-                    "[SimHand] cmd "
-                    f"L_q={np.round(left_cmd_q, 3)} L_kp={np.round(left_cmd_kp, 3)} "
-                    f"L_kd={np.round(left_cmd_kd, 3)} "
-                    f"R_q={np.round(right_cmd_q, 3)} R_kp={np.round(right_cmd_kp, 3)} "
-                    f"R_kd={np.round(right_cmd_kd, 3)}"
-                )
-                print(
-                    "[SimHand] state "
-                    f"L_meas={np.round(left_meas_q, 3)} L_tau={np.round(left_hand_torques, 3)} "
-                    f"R_meas={np.round(right_meas_q, 3)} R_tau={np.round(right_hand_torques, 3)}"
                 )
         return np.concatenate((left_hand_torques, right_hand_torques))
 

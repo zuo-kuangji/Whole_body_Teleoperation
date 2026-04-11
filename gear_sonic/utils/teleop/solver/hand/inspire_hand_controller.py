@@ -6,7 +6,7 @@ retargeting pipeline, runs DexPilot retargeting to get 6-DOF joint angles, and
 sends commands to Inspire hands via Unitree DDS.
 
 Usage:
-    controller = InspireHandController(mode="DFX")
+    controller = InspireHandController(mode="FTP")
     controller.start()  # starts background thread
     # In your loop:
     controller.update(left_hand_state, right_hand_state)
@@ -26,6 +26,7 @@ from gear_sonic.utils.teleop.solver.hand.inspire_hand_mapping import (
     xrt_hand_state_to_unitree_hand_positions,
 )
 from gear_sonic.utils.teleop.solver.hand.inspire_hand_sources import (
+    INSPIRE_HAND_SDK_ROOT,
     XR_TELEOP_ROOT,
     XR_TELEOP_TELEOP_DIR,
     choose_inspire_config_path,
@@ -37,6 +38,7 @@ from gear_sonic.utils.teleop.solver.hand.inspire_hand_sources import (
 _DEX_RETARGET_PATH = "/home/g1/zuo/xr_teleoperate/teleop/robot_control/dex-retargeting/src"
 prepend_sys_path(XR_TELEOP_ROOT)
 prepend_sys_path(Path(_DEX_RETARGET_PATH))
+prepend_sys_path(INSPIRE_HAND_SDK_ROOT)
 
 from dex_retargeting.retargeting_config import RetargetingConfig
 
@@ -57,10 +59,6 @@ FINGER_COMMAND_NAMES = [
     "thumb_pitch",
     "thumb_yaw",
 ]
-OPENXR_TIP_NAMES = ["thumb_tip", "index_tip", "middle_tip", "ring_tip", "pinky_tip"]
-OPENXR_TIP_INDICES = [4, 9, 14, 19, 24]
-XRT_TIP_INDICES = [5, 10, 15, 20, 25]
-XRT_WRIST_INDEX = 1
 
 # Joint normalization ranges (radians) — from xr_teleoperate
 # Order after hardware reorder: [pinky, ring, middle, index, thumb_pitch, thumb_yaw]
@@ -72,6 +70,17 @@ JOINT_RANGES = [
     (0.0, 0.5),   # thumb pitch (bend)
     (-0.1, 1.3),  # thumb yaw (rotation)
 ]
+
+
+def get_inspire_hand_transport_mode(*, hand_sim: bool) -> str:
+    """Return the DDS transport mode used for Inspire hands.
+
+    We intentionally keep simulation and real hardware on the same FTP-style DDS
+    topics so the receive side can be tested end-to-end without changing
+    transport conventions between environments.
+    """
+    _ = hand_sim
+    return "FTP"
 
 
 def _normalize(val, min_val, max_val):
@@ -197,17 +206,13 @@ class InspireHandController:
       - "FTP": Separate topics rt/inspire_hand/ctrl/l and rt/inspire_hand/ctrl/r
     """
 
-    def __init__(self, mode="DFX", fps=50.0, sim=False):
+    def __init__(self, mode="FTP", fps=50.0, sim=False):
         self.mode = mode
         self.fps = fps
         self.sim = sim
         self.running = False
         self._thread = None
         self.retargeting = InspireHandRetargeting()
-        print(
-            "[InspireHand] Retargeting source:"
-            f" {self.retargeting.source} ({self.retargeting.config_path})"
-        )
         if self.retargeting.upstream_error is not None:
             print(
                 "[InspireHand] Upstream HandRetargeting unavailable, using local fallback:"
@@ -236,9 +241,9 @@ class InspireHandController:
             self._pub = ChannelPublisher("rt/inspire/cmd", MotorCmds_)
             self._pub.Init()
         else:  # FTP
-            from inspire_sdkpy import inspire_dds
-            self._left_pub = ChannelPublisher("rt/inspire_hand/ctrl/l", inspire_dds.inspire_hand_ctrl)
-            self._right_pub = ChannelPublisher("rt/inspire_hand/ctrl/r", inspire_dds.inspire_hand_ctrl)
+            from inspire_dds import inspire_hand_ctrl
+            self._left_pub = ChannelPublisher("rt/inspire_hand/ctrl/l", inspire_hand_ctrl)
+            self._right_pub = ChannelPublisher("rt/inspire_hand/ctrl/r", inspire_hand_ctrl)
             self._left_pub.Init()
             self._right_pub.Init()
 
@@ -259,7 +264,6 @@ class InspireHandController:
         self.running = True
         self._thread = threading.Thread(target=self._control_loop, daemon=True)
         self._thread.start()
-        print("[InspireHand] Control thread started")
 
     def stop(self):
         """Stop the background control thread."""
@@ -267,18 +271,12 @@ class InspireHandController:
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
-        print("[InspireHand] Control thread stopped")
 
     def _control_loop(self):
         self._init_dds()
 
         left_cmd = np.ones(INSPIRE_NUM_MOTORS)  # 1.0 = fully open
         right_cmd = np.ones(INSPIRE_NUM_MOTORS)
-        left_raw_cmd = left_cmd.copy()
-        right_raw_cmd = right_cmd.copy()
-        left_25 = None
-        right_25 = None
-        _print_counter = 0
 
         while self.running:
             t0 = time.time()
@@ -290,7 +288,6 @@ class InspireHandController:
                 right_arm_pose = self._right_arm_pose
 
             has_data = left_state is not None and right_state is not None
-            did_retarget = False
 
             if has_data:
                 left_25 = pico_to_openxr_25(left_state, arm_pose=left_arm_pose)
@@ -299,52 +296,11 @@ class InspireHandController:
                 # Skip if data looks uninitialized
                 if not (np.all(left_25 == 0) or np.all(right_25 == 0)):
                     try:
-                        left_raw_cmd, right_raw_cmd = self.retargeting.retarget(left_25, right_25)
-                        left_cmd = remap_normalized_hand_command(left_raw_cmd)
-                        right_cmd = remap_normalized_hand_command(right_raw_cmd)
-                        did_retarget = True
+                        left_cmd_raw, right_cmd_raw = self.retargeting.retarget(left_25, right_25)
+                        left_cmd = remap_normalized_hand_command(left_cmd_raw)
+                        right_cmd = remap_normalized_hand_command(right_cmd_raw)
                     except Exception as e:
                         print(f"[InspireHand] Retargeting error: {e}")
-
-            # Debug print every 50 ticks (~1s at 50Hz)
-            _print_counter += 1
-            if _print_counter % 50 == 0:
-                if not has_data:
-                    print(f"[InspireHand] No hand tracking data (left={left_state is not None}, right={right_state is not None})")
-                else:
-                    print(f"[InspireHand] retarget={did_retarget} L_cmd={np.round(left_cmd, 2)}")
-                    if did_retarget and left_25 is not None and right_25 is not None:
-                        left_state_tip_norms = None
-                        if left_state is not None:
-                            left_state_arr = np.asarray(left_state, dtype=np.float64)
-                            if left_state_arr.ndim == 2 and left_state_arr.shape[0] >= 26 and left_state_arr.shape[1] >= 3:
-                                left_state_tip_norms = np.linalg.norm(
-                                    left_state_arr[XRT_TIP_INDICES, :3]
-                                    - left_state_arr[XRT_WRIST_INDEX:XRT_WRIST_INDEX + 1, :3],
-                                    axis=1,
-                                )
-                        left_tip_norms = np.linalg.norm(left_25[OPENXR_TIP_INDICES], axis=1)
-                        right_tip_norms = np.linalg.norm(right_25[OPENXR_TIP_INDICES], axis=1)
-                        if left_state_tip_norms is not None:
-                            print(
-                                "[InspireHand] xrt_tip_dists "
-                                f"L={dict(zip(OPENXR_TIP_NAMES, np.round(left_state_tip_norms, 3)))} "
-                            )
-                        print(
-                            "[InspireHand] raw_named "
-                            f"L={dict(zip(FINGER_COMMAND_NAMES, np.round(left_raw_cmd, 3)))} "
-                            # f"R={dict(zip(FINGER_COMMAND_NAMES, np.round(right_raw_cmd, 3)))}"
-                        )
-                        print(
-                            "[InspireHand] remap_named "
-                            f"L={dict(zip(FINGER_COMMAND_NAMES, np.round(left_cmd, 3)))} "
-                            # f"R={dict(zip(FINGER_COMMAND_NAMES, np.round(right_cmd, 3)))}"
-                        )
-                        print(
-                            "[InspireHand] tip_norms "
-                            f"L={dict(zip(OPENXR_TIP_NAMES, np.round(left_tip_norms, 3)))} "
-                            # f"R={dict(zip(OPENXR_TIP_NAMES, np.round(right_tip_norms, 3)))}"
-                        )
 
             self._send_command(left_cmd, right_cmd)
 
@@ -386,14 +342,22 @@ class InspireHandController:
         self._pub.Write(msg)
 
     def _send_ftp(self, left_cmd, right_cmd):
-        import inspire_sdkpy.inspire_hand_defaut as inspire_hand_default
+        from inspire_dds import inspire_hand_ctrl
 
-        left_msg = inspire_hand_default.get_inspire_hand_ctrl()
-        left_msg.angle_set = [int(np.clip(v * 1000, 0, 1000)) for v in left_cmd]
-        left_msg.mode = 0b0001
+        left_msg = inspire_hand_ctrl(
+            pos_set=[0 for _ in range(INSPIRE_NUM_MOTORS)],
+            angle_set=[int(np.clip(v * 1000, 0, 1000)) for v in left_cmd],
+            force_set=[0 for _ in range(INSPIRE_NUM_MOTORS)],
+            speed_set=[0 for _ in range(INSPIRE_NUM_MOTORS)],
+            mode=0b0001,
+        )
         self._left_pub.Write(left_msg)
 
-        right_msg = inspire_hand_default.get_inspire_hand_ctrl()
-        right_msg.angle_set = [int(np.clip(v * 1000, 0, 1000)) for v in right_cmd]
-        right_msg.mode = 0b0001
+        right_msg = inspire_hand_ctrl(
+            pos_set=[0 for _ in range(INSPIRE_NUM_MOTORS)],
+            angle_set=[int(np.clip(v * 1000, 0, 1000)) for v in right_cmd],
+            force_set=[0 for _ in range(INSPIRE_NUM_MOTORS)],
+            speed_set=[0 for _ in range(INSPIRE_NUM_MOTORS)],
+            mode=0b0001,
+        )
         self._right_pub.Write(right_msg)

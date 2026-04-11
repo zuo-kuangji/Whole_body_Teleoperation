@@ -22,6 +22,26 @@ from unitree_sdk2py.idl.default import (
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import MotorCmds_, MotorStates_, WirelessController_
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import HandCmd_, HandState_, OdoState_
 
+_INSPIRE_HAND_SDK_PATH = "/home/g1/hsj/inspire_hand_ws/inspire_hand_sdk/inspire_sdkpy"
+if _INSPIRE_HAND_SDK_PATH not in sys.path:
+    sys.path.insert(0, _INSPIRE_HAND_SDK_PATH)
+
+
+INSPIRE_FTP_MAX_COMMAND = 1000.0
+INSPIRE_JOINT_RANGES = [
+    (0.0, 1.7),   # pinky
+    (0.0, 1.7),   # ring
+    (0.0, 1.7),   # middle
+    (0.0, 1.7),   # index
+    (0.0, 0.5),   # thumb pitch (bend)
+    (-0.1, 1.3),  # thumb yaw (rotation)
+]
+
+
+def _ftp_angle_set_to_radians(angle_set: int, min_val: float, max_val: float) -> float:
+    normalized = np.clip(float(angle_set) / INSPIRE_FTP_MAX_COMMAND, 0.0, 1.0)
+    return max_val - normalized * (max_val - min_val)
+
 
 class UnitreeSdk2Bridge:
     """
@@ -83,7 +103,8 @@ class UnitreeSdk2Bridge:
         self.torso_imu_puber.Init()
 
         if self.hand_type == "inspire":
-            # Inspire hand: single combined topic for both hands (12 motors: right=0-5, left=6-11)
+            # Inspire hand: keep publishing combined state for compatibility with existing
+            # G1 utilities, but receive commands over the FTP-style per-hand DDS topics.
             self.inspire_hand_state = MotorStates_()
             self.inspire_hand_state.states = [MotorState_default() for _ in range(12)]
             self.inspire_hand_state_puber = ChannelPublisher("rt/inspire/state", MotorStates_)
@@ -114,15 +135,17 @@ class UnitreeSdk2Bridge:
         self.low_cmd_suber.Init(self.LowCmdHandler, 1)
 
         if self.hand_type == "inspire":
-            # Inspire hand: single combined command topic
-            self.inspire_hand_cmd = MotorCmds_()
-            self.inspire_hand_cmd.cmds = [MotorCmd_default() for _ in range(12)]
-            self.inspire_hand_cmd_suber = ChannelSubscriber("rt/inspire/cmd", MotorCmds_)
-            self.inspire_hand_cmd_suber.Init(self.InspireHandCmdHandler, 1)
+            from inspire_dds import inspire_hand_ctrl
+
+            # Inspire hand: FTP-style per-hand DDS control topics.
+            self.inspire_hand_cmd = None
+            self.inspire_hand_cmd_suber = None
             self.left_hand_cmd = HandCmd_default()
+            self.left_hand_cmd_suber = ChannelSubscriber("rt/inspire_hand/ctrl/l", inspire_hand_ctrl)
+            self.left_hand_cmd_suber.Init(self.LeftInspireFtpCmdHandler, 1)
             self.right_hand_cmd = HandCmd_default()
-            self.left_hand_cmd_suber = None
-            self.right_hand_cmd_suber = None
+            self.right_hand_cmd_suber = ChannelSubscriber("rt/inspire_hand/ctrl/r", inspire_hand_ctrl)
+            self.right_hand_cmd_suber.Init(self.RightInspireFtpCmdHandler, 1)
         else:
             # Dex3 hand: separate command topics per hand
             self.inspire_hand_cmd = None
@@ -161,9 +184,6 @@ class UnitreeSdk2Bridge:
         }
         self.joystick = None
 
-        # Inspire hand debug logging (throttled to avoid flooding the terminal)
-        self.inspire_debug_counter = 0
-        self.inspire_debug_every = 50
         # Incoming Inspire DDS order is hardware-centric:
         #   [pinky, ring, middle, index, thumb_pitch, thumb_yaw]
         # MuJoCo hand joints/actuators are ordered as:
@@ -234,62 +254,33 @@ class UnitreeSdk2Bridge:
                     dst.kp = src.kp
                     dst.kd = src.kd
                 self.left_hand_cmd_received = True
-                self.new_left_hand_cmd = True
+            self.new_left_hand_cmd = True
             self.inspire_hand_cmd_received = True
             self.new_inspire_hand_cmd = True
 
-            self.inspire_debug_counter += 1
-            if self.inspire_debug_counter % self.inspire_debug_every == 0:
-                right_in_q = np.array([msg.cmds[i].q for i in range(self.num_hand_motor)], dtype=np.float64)
-                right_in_kp = np.array([msg.cmds[i].kp for i in range(self.num_hand_motor)], dtype=np.float64)
-                right_in_kd = np.array([msg.cmds[i].kd for i in range(self.num_hand_motor)], dtype=np.float64)
-                left_in_q = np.array(
-                    [msg.cmds[6 + i].q for i in range(self.num_hand_motor)], dtype=np.float64
-                )
-                left_in_kp = np.array(
-                    [msg.cmds[6 + i].kp for i in range(self.num_hand_motor)], dtype=np.float64
-                )
-                left_in_kd = np.array(
-                    [msg.cmds[6 + i].kd for i in range(self.num_hand_motor)], dtype=np.float64
-                )
-                right_mapped_q = np.array(
-                    [self.right_hand_cmd.motor_cmd[i].q for i in range(self.num_hand_motor)],
-                    dtype=np.float64,
-                )
-                right_mapped_kp = np.array(
-                    [self.right_hand_cmd.motor_cmd[i].kp for i in range(self.num_hand_motor)],
-                    dtype=np.float64,
-                )
-                right_mapped_kd = np.array(
-                    [self.right_hand_cmd.motor_cmd[i].kd for i in range(self.num_hand_motor)],
-                    dtype=np.float64,
-                )
-                left_mapped_q = np.array(
-                    [self.left_hand_cmd.motor_cmd[i].q for i in range(self.num_hand_motor)],
-                    dtype=np.float64,
-                )
-                left_mapped_kp = np.array(
-                    [self.left_hand_cmd.motor_cmd[i].kp for i in range(self.num_hand_motor)],
-                    dtype=np.float64,
-                )
-                left_mapped_kd = np.array(
-                    [self.left_hand_cmd.motor_cmd[i].kd for i in range(self.num_hand_motor)],
-                    dtype=np.float64,
-                )
-                print(
-                    "[BridgeHand] incoming "
-                    f"R_q={np.round(right_in_q, 3)} R_kp={np.round(right_in_kp, 3)} "
-                    f"R_kd={np.round(right_in_kd, 3)} "
-                    f"L_q={np.round(left_in_q, 3)} L_kp={np.round(left_in_kp, 3)} "
-                    f"L_kd={np.round(left_in_kd, 3)}"
-                )
-                print(
-                    "[BridgeHand] mapped   "
-                    f"R_q={np.round(right_mapped_q, 3)} R_kp={np.round(right_mapped_kp, 3)} "
-                    f"R_kd={np.round(right_mapped_kd, 3)} "
-                    f"L_q={np.round(left_mapped_q, 3)} L_kp={np.round(left_mapped_kp, 3)} "
-                    f"L_kd={np.round(left_mapped_kd, 3)}"
-                )
+    def _ApplyInspireFtpCmd(self, msg, hand_cmd):
+        for i in range(self.num_hand_motor):
+            src_idx = self.inspire_to_mj_order[i]
+            min_val, max_val = INSPIRE_JOINT_RANGES[src_idx]
+            dst = hand_cmd.motor_cmd[i]
+            dst.mode = 1
+            dst.q = _ftp_angle_set_to_radians(msg.angle_set[src_idx], min_val, max_val)
+            dst.dq = 0.0
+            dst.tau = 0.0
+            dst.kp = 4.0
+            dst.kd = 0.2
+
+    def LeftInspireFtpCmdHandler(self, msg):
+        with self.left_hand_cmd_lock:
+            self._ApplyInspireFtpCmd(msg, self.left_hand_cmd)
+            self.left_hand_cmd_received = True
+            self.new_left_hand_cmd = True
+
+    def RightInspireFtpCmdHandler(self, msg):
+        with self.right_hand_cmd_lock:
+            self._ApplyInspireFtpCmd(msg, self.right_hand_cmd)
+            self.right_hand_cmd_received = True
+            self.new_right_hand_cmd = True
 
     def cmd_received(self):
         with self.low_cmd_lock:
