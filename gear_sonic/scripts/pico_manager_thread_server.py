@@ -25,7 +25,9 @@
 from collections import defaultdict, deque
 from enum import Enum, IntEnum
 import os
+from pathlib import Path
 import subprocess
+import sys
 import threading
 import time
 
@@ -112,6 +114,49 @@ try:
 except ImportError:
     print("Warning: get_g1_key_frame_poses not available (pyvista may not be installed).")
     get_g1_key_frame_poses = None
+
+
+def _build_xr_episode_recorder(
+    *,
+    task_dir: str,
+    task_name: str | None,
+    task_goal: str | None,
+    task_desc: str | None,
+    task_steps: str | None,
+    camera_host: str,
+    camera_port: int,
+    enable_depth: bool,
+    disable_camera: bool,
+    frequency: int,
+):
+    workspace_root = Path(__file__).resolve().parents[3]
+    if str(workspace_root) not in sys.path:
+        sys.path.insert(0, str(workspace_root))
+
+    from episode_writter.episode_writer import EpisodeWriter
+    from episode_writter.gear_sonic_bridge import GearSonicRecorderBridge, decode_feedback_frame
+    from episode_writter.robot_sources import CameraFrameProvider
+
+    resolved_task_dir = Path(task_dir)
+    if task_name:
+        resolved_task_dir = resolved_task_dir / task_name
+
+    camera_provider = None
+    if not disable_camera:
+        camera_provider = CameraFrameProvider(
+            host=camera_host,
+            request_port=camera_port,
+            enable_depth=enable_depth,
+        )
+
+    writer = EpisodeWriter(
+        task_dir=resolved_task_dir,
+        task_goal=task_goal,
+        task_desc=task_desc,
+        task_steps=task_steps,
+        frequency=frequency,
+    )
+    return GearSonicRecorderBridge(writer=writer, camera_provider=camera_provider), decode_feedback_frame
 
 
 class LocomotionMode(IntEnum):
@@ -1834,6 +1879,15 @@ def run_pico_manager(
     enable_smpl_vis: bool = False,
     hand_type: str = "dex3",
     hand_sim: bool = False,
+    task_dir: str = "",
+    task_name: str | None = None,
+    task_goal: str | None = None,
+    task_desc: str | None = None,
+    task_steps: str | None = None,
+    disable_camera: bool = False,
+    camera_host: str = "192.168.123.164",
+    camera_port: int = 60000,
+    enable_depth: bool = False,
     # auto_pose_delay: float | None = None,
 ):
     """
@@ -1936,6 +1990,29 @@ def run_pico_manager(
         zmq_feedback_port=zmq_feedback_port,
     )
 
+    xr_recorder = None
+    xr_feedback_poller = None
+    xr_decode_feedback = None
+    if task_dir:
+        xr_recorder, xr_decode_feedback = _build_xr_episode_recorder(
+            task_dir=task_dir,
+            task_name=task_name,
+            task_goal=task_goal,
+            task_desc=task_desc,
+            task_steps=task_steps,
+            camera_host=camera_host,
+            camera_port=camera_port,
+            enable_depth=enable_depth,
+            disable_camera=disable_camera,
+            frequency=target_fps,
+        )
+        xr_feedback_poller = ZMQPoller(
+            host=zmq_feedback_host,
+            port=zmq_feedback_port,
+            topic="g1_debug",
+        )
+        print(f"[Manager] XR recorder enabled at: {task_dir}")
+
     # State machine diagram:
     #
     #   Chain 1 (by_pressed enters/exits, left_axis_click toggles sub-mode):
@@ -1961,11 +2038,38 @@ def run_pico_manager(
         prev_by_pressed = False
         prev_start_combo = False
         prev_left_axis_click = False
+        prev_record_collection = False
+        prev_record_abort = False
         while True:
             # Poll Pico controller for buttons/axes
             a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons()
 
             left_menu_button, _, _, _, _ = get_controller_inputs()
+
+            record_collection_pressed = bool(a_pressed)
+            record_abort_pressed = bool(b_pressed)
+            toggle_data_collection = record_collection_pressed and not prev_record_collection
+            toggle_data_abort = record_abort_pressed and not prev_record_abort
+
+            if xr_feedback_poller is not None and xr_decode_feedback is not None and xr_recorder is not None:
+                feedback_data = xr_feedback_poller.get_data()
+                if feedback_data is not None:
+                    try:
+                        xr_recorder.observe_feedback(xr_decode_feedback(feedback_data))
+                    except Exception as exc:
+                        print(f"[Manager] XR recorder feedback decode failed: {exc}")
+
+            if xr_recorder is not None:
+                if toggle_data_abort:
+                    if xr_recorder.toggle_abort():
+                        print("[Manager] XR recorder aborted current episode")
+                elif toggle_data_collection:
+                    was_recording = xr_recorder.is_recording
+                    is_recording = xr_recorder.toggle_collection()
+                    if not was_recording and is_recording:
+                        print("[Manager] XR recorder started episode")
+                    elif was_recording and not xr_recorder.is_recording:
+                        print("[Manager] XR recorder saved episode")
 
             left_axis_click, _ = get_axis_clicks()
 
@@ -2123,6 +2227,8 @@ def run_pico_manager(
             prev_by_pressed = by_pressed
             prev_start_combo = start_combo
             prev_left_axis_click = left_axis_click
+            prev_record_collection = record_collection_pressed
+            prev_record_abort = record_abort_pressed
 
     except KeyboardInterrupt:
         print("\nStopping manager...")
@@ -2130,6 +2236,10 @@ def run_pico_manager(
         # Cleanup resources
         reader.stop()
         three_point.close()
+        if xr_recorder is not None:
+            xr_recorder.close()
+        if xr_feedback_poller is not None:
+            xr_feedback_poller.close()
         if raw_hand_visualizer is not None:
             raw_hand_visualizer.close()
         if inspire_controller is not None:
@@ -2246,6 +2356,40 @@ if __name__ == "__main__":
         default=None,
         help="Automatically enter POSE after this many seconds in manager mode (default: disabled)",
     )
+    parser.add_argument(
+        "--task-dir",
+        type=str,
+        default="",
+        help="Enable xr-style recording and write episode_xxxx folders under this directory",
+    )
+    parser.add_argument("--task-name", type=str, default=None, help="Optional task subdirectory name")
+    parser.add_argument("--task-goal", type=str, default=None, help="Task goal text stored in data.json")
+    parser.add_argument("--task-desc", type=str, default=None, help="Task description stored in data.json")
+    parser.add_argument("--task-steps", type=str, default=None, help="Task steps stored in data.json")
+    parser.add_argument(
+        "--camera-host",
+        "--img-server-ip",
+        dest="camera_host",
+        type=str,
+        default="192.168.123.164",
+        help="XR teleimager host for recorder cameras (default: 192.168.123.164)",
+    )
+    parser.add_argument(
+        "--camera-port",
+        type=int,
+        default=60000,
+        help="XR teleimager request port for recorder cameras (default: 60000)",
+    )
+    parser.add_argument(
+        "--disable-camera",
+        action="store_true",
+        help="Record robot state/actions only, without pulling teleimager frames",
+    )
+    parser.add_argument(
+        "--enable-depth",
+        action="store_true",
+        help="Record head depth frames alongside RGB when xr-style recording is enabled",
+    )
     args = parser.parse_args()
 
     # Standalone VR3Pt test modes (exit after finishing)
@@ -2289,6 +2433,15 @@ if __name__ == "__main__":
             enable_smpl_vis=args.vis_smpl,
             hand_type=args.hand_type,
             hand_sim=args.hand_sim,
+            task_dir=args.task_dir,
+            task_name=args.task_name,
+            task_goal=args.task_goal,
+            task_desc=args.task_desc,
+            task_steps=args.task_steps,
+            disable_camera=args.disable_camera,
+            camera_host=args.camera_host,
+            camera_port=args.camera_port,
+            enable_depth=args.enable_depth,
             # auto_pose_delay=args.auto_pose_delay,
         )
     else:

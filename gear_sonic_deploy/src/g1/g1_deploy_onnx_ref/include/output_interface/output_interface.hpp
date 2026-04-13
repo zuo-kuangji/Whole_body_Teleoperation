@@ -44,6 +44,7 @@
 
 #include "../state_logger.hpp"
 #include "../motion_data_reader.hpp"
+#include "output_payload_utils.hpp"
 
 /**
  * @class OutputInterface
@@ -253,8 +254,9 @@ protected:
         output_data_map_[kBaseTransMeasured].assign(base_trans_measured.begin(), base_trans_measured.end());
         output_data_map_[kBaseQuatMeasured].assign(base_quat_measured.begin(), base_quat_measured.end());
         output_data_map_[kBodyQMeasured].assign(body_q_measured.begin(), body_q_measured.end());
-        output_data_map_[kLeftHandQMeasured].assign(left_hand_joint.begin(), left_hand_joint.end());
-        output_data_map_[kRightHandQMeasured].assign(right_hand_joint.begin(), right_hand_joint.end());
+        output_data_map_[kLeftHandQMeasured] = state.left_hand_q;
+        output_data_map_[kRightHandQMeasured] = state.right_hand_q;
+        append_logger_feedback_fields(output_data_map_, state);
 
         // write vr controller data:
         output_data_map_[kVr3pointPosition].assign(vr_3point_position_sent.begin(), vr_3point_position_sent.end());
@@ -287,4 +289,3 @@ protected:
 };
 
 #endif // OUTPUT_INTERFACE_HPP
-

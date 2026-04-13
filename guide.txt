@@ -107,7 +107,7 @@ bash deploy.sh --input-type zmq_manager sim
 # Terminal 3 — PICO 遥操（全身 + Inspire 手）
 source .venv_teleop/bin/activate
 python gear_sonic/scripts/pico_manager_thread_server.py \
-    --manager --hand-type inspire --hand-sim --vis_raw_hand
+    --manager --hand-type inspire --hand-sim --vis_raw_hand --task-dir /tmp/ep_test
 
 
 真机模式（Inspire 手）— 2 个 Terminal
@@ -122,4 +122,9 @@ bash deploy.sh --input-type zmq_manager real
 cd /home/g1/hsj/GR00T-WholeBodyControl
 source .venv_teleop/bin/activate
 python gear_sonic/scripts/pico_manager_thread_server.py \
-    --manager --hand-type inspire
+    --manager --hand-type inspire --task-dir /tmp/ep_test
+
+
+render 采集数据
+source .venv_teleop/bin/activate
+python gear_sonic/scripts/replay_episode_mujoco.py --episode /home/g1/hsj/tmp/episode_0002
