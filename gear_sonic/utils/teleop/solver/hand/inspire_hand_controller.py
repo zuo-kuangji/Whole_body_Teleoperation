@@ -72,15 +72,22 @@ JOINT_RANGES = [
 ]
 
 
-def get_inspire_hand_transport_mode(*, hand_sim: bool) -> str:
+def get_inspire_hand_transport_mode(*, hand_sim: bool, transport: str | None = None) -> str:
     """Return the DDS transport mode used for Inspire hands.
 
-    We intentionally keep simulation and real hardware on the same FTP-style DDS
-    topics so the receive side can be tested end-to-end without changing
-    transport conventions between environments.
+    Args:
+        hand_sim: Present for call-site symmetry with the manager. The default
+            remains FTP regardless of environment.
+        transport: Optional explicit override, one of {"ftp", "dfx"}.
     """
     _ = hand_sim
-    return "FTP"
+    if transport is None:
+        return "FTP"
+
+    normalized = transport.strip().upper()
+    if normalized not in {"FTP", "DFX"}:
+        raise ValueError(f"Unsupported Inspire hand transport: {transport}")
+    return normalized
 
 
 def _normalize(val, min_val, max_val):

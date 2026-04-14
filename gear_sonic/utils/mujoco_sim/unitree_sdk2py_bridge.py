@@ -137,9 +137,12 @@ class UnitreeSdk2Bridge:
         if self.hand_type == "inspire":
             from inspire_dds import inspire_hand_ctrl
 
-            # Inspire hand: FTP-style per-hand DDS control topics.
-            self.inspire_hand_cmd = None
-            self.inspire_hand_cmd_suber = None
+            # Inspire hand: accept both FTP-style per-hand topics and the legacy
+            # combined DFX topic so the sender can be selected at runtime.
+            self.inspire_hand_cmd = MotorCmds_()
+            self.inspire_hand_cmd.cmds = [MotorCmd_default() for _ in range(12)]
+            self.inspire_hand_cmd_suber = ChannelSubscriber("rt/inspire/cmd", MotorCmds_)
+            self.inspire_hand_cmd_suber.Init(self.InspireHandCmdHandler, 1)
             self.left_hand_cmd = HandCmd_default()
             self.left_hand_cmd_suber = ChannelSubscriber("rt/inspire_hand/ctrl/l", inspire_hand_ctrl)
             self.left_hand_cmd_suber.Init(self.LeftInspireFtpCmdHandler, 1)

@@ -39,7 +39,7 @@ class UnitreeSdk2BridgeTransportTest(unittest.TestCase):
         _FakePublisher.instances.clear()
         _FakeSubscriber.instances.clear()
 
-    def test_inspire_bridge_subscribes_ftp_control_topics(self):
+    def test_inspire_bridge_subscribes_both_ftp_and_dfx_control_topics(self):
         config = {
             "ROBOT_TYPE": "g1",
             "NUM_MOTORS": 29,
@@ -56,7 +56,7 @@ class UnitreeSdk2BridgeTransportTest(unittest.TestCase):
         subscriber_topics = {subscriber.topic for subscriber in _FakeSubscriber.instances}
         self.assertIn("rt/inspire_hand/ctrl/l", subscriber_topics)
         self.assertIn("rt/inspire_hand/ctrl/r", subscriber_topics)
-        self.assertNotIn("rt/inspire/cmd", subscriber_topics)
+        self.assertIn("rt/inspire/cmd", subscriber_topics)
 
 
 if __name__ == "__main__":

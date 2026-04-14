@@ -1879,6 +1879,7 @@ def run_pico_manager(
     enable_smpl_vis: bool = False,
     hand_type: str = "dex3",
     hand_sim: bool = False,
+    inspire_transport: str | None = None,
     task_dir: str = "",
     task_name: str | None = None,
     task_goal: str | None = None,
@@ -1926,12 +1927,12 @@ def run_pico_manager(
             except Exception:
                 pass
         inspire_controller = InspireHandController(
-            mode=get_inspire_hand_transport_mode(hand_sim=hand_sim),
+            mode=get_inspire_hand_transport_mode(hand_sim=hand_sim, transport=inspire_transport),
             fps=50.0,
             sim=hand_sim,
         )
         inspire_controller.start()
-        print("[Manager] Inspire hand controller started")
+        print(f"[Manager] Inspire hand controller started ({inspire_controller.mode})")
 
     raw_hand_visualizer = None
     if enable_vis_raw_hand:
@@ -2351,6 +2352,13 @@ if __name__ == "__main__":
         help="Enable sim mode for Inspire hand (sends radians + PD gains instead of normalized values)",
     )
     parser.add_argument(
+        "--inspire-transport",
+        type=str,
+        choices=["ftp", "dfx"],
+        default="ftp",
+        help="DDS transport for Inspire hand control: 'ftp' (default) or 'dfx'",
+    )
+    parser.add_argument(
         "--auto-pose-delay",
         type=float,
         default=None,
@@ -2433,6 +2441,7 @@ if __name__ == "__main__":
             enable_smpl_vis=args.vis_smpl,
             hand_type=args.hand_type,
             hand_sim=args.hand_sim,
+            inspire_transport=args.inspire_transport,
             task_dir=args.task_dir,
             task_name=args.task_name,
             task_goal=args.task_goal,
