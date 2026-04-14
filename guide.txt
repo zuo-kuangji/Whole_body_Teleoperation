@@ -131,3 +131,10 @@ python gear_sonic/scripts/pico_manager_thread_server.py \
 render 采集数据
 source .venv_teleop/bin/activate
 python gear_sonic/scripts/replay_episode_mujoco.py --episode /home/g1/hsj/tmp/episode_0002
+
+
+
+键盘操作：
+p：进入planner
+o：进入全身遥操
+v：进入键盘控制下半身的遥操

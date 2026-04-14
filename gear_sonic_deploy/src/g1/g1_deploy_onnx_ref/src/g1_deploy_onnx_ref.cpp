@@ -3512,14 +3512,20 @@ class G1Deploy {
           // Update Dex3 hands max close ratio from keyboard-controlled value (X/C keys)
           dex3_hands_.SetMaxCloseRatio(input_interface_->GetMaxCloseRatio());
           
-          // set hand poses (use buffered data for consistency)
-          dex3_hands_.setAllJointsCommand(true, left_hand_joint_buffer_);
-          dex3_hands_.setAllJointsCommand(false, right_hand_joint_buffer_);
-          
-          // Update last hand actions for logging (use buffered data)
-          for (int i = 0; i < 7; ++i) {
-            last_left_hand_action[i] = left_hand_joint_buffer_[i];
-            last_right_hand_action[i] = right_hand_joint_buffer_[i];
+          // Only drive the hands when the active input mode actually provided
+          // fresh hand targets. This keeps PLANNER / FROZEN / VR_3PT from
+          // commanding the hands unless POSE data is explicitly present.
+          if (has_left_hand_data_) {
+            dex3_hands_.setAllJointsCommand(true, left_hand_joint_buffer_);
+            for (int i = 0; i < 7; ++i) {
+              last_left_hand_action[i] = left_hand_joint_buffer_[i];
+            }
+          }
+          if (has_right_hand_data_) {
+            dex3_hands_.setAllJointsCommand(false, right_hand_joint_buffer_);
+            for (int i = 0; i < 7; ++i) {
+              last_right_hand_action[i] = right_hand_joint_buffer_[i];
+            }
           }
           
           auto hand_joint_end_time = std::chrono::steady_clock::now();

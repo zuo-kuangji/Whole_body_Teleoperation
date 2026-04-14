@@ -38,6 +38,15 @@ import torch
 import zmq
 
 from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
+from gear_sonic.utils.teleop.manager_mode_controls import (
+    ConsoleKeyMonitor,
+    KEYBOARD_MODE_HELP,
+    VR3PTKeyboardMotion,
+    consume_latest_keyboard_key,
+    hand_control_enabled_for_mode,
+    next_mode_from_keyboard,
+    resolve_vr3pt_locomotion_mode,
+)
 
 from gear_sonic.trl.utils.rotation_conversion import decompose_rotation_aa
 from gear_sonic.trl.utils.torch_transform import (
@@ -1310,6 +1319,7 @@ class PoseStreamer:
             True  # Start with buffer cleared - wait for full buffer before first send
         )
         self.yaw_accumulator = YawAccumulator()
+        self.hand_control_enabled = True
 
     def reset_yaw(self):
         """Called when entering pose mode. Resets yaw only.
@@ -1355,14 +1365,18 @@ class PoseStreamer:
         self.toggle_data_collection_last = toggle_data_collection_tmp
         self.toggle_data_abort_last = toggle_data_abort_tmp
 
-        left_hand_joints, right_hand_joints = compute_hand_joints_from_inputs(
-            self.left_hand_ik_solver,
-            self.right_hand_ik_solver,
-            left_trigger,
-            left_grip,
-            right_trigger,
-            right_grip,
-        )
+        if self.hand_control_enabled:
+            left_hand_joints, right_hand_joints = compute_hand_joints_from_inputs(
+                self.left_hand_ik_solver,
+                self.right_hand_ik_solver,
+                left_trigger,
+                left_grip,
+                right_trigger,
+                right_grip,
+            )
+        else:
+            left_hand_joints = np.zeros((1, 7), dtype=np.float32)
+            right_hand_joints = np.zeros((1, 7), dtype=np.float32)
         smpl_pose_np = (
             latest_data["smpl_pose"].detach().cpu().numpy()[:, :63].reshape(-1, 21, 3)[0]
         ).astype(np.float32)
@@ -1702,11 +1716,15 @@ class PlannerStreamer:
         self.prev_xy = False
         # Persistent facing buffer (unit vector on XY plane)
         self.yaw_accumulator = YawAccumulator()
+        self.vr3pt_keyboard_motion = VR3PTKeyboardMotion()
         self.last_send = time.time()
         self.last_xrt_timestamp = None
 
         # Hand IK solvers for trigger-controlled hand open/close in VR 3PT mode
         self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
+
+    def observe_keyboard_key(self, key: str | None) -> None:
+        self.vr3pt_keyboard_motion.observe_key(key)
 
     def reset_yaw(self):
         """Called when entering planner mode. Resets state for fresh start."""
@@ -1760,6 +1778,8 @@ class PlannerStreamer:
 
             # Read axes/joysticks to control movement, facing, speed and mode
             lx, ly, rx, ry = get_controller_axes()
+            if stream_mode == StreamMode.PLANNER_VR_3PT:
+                lx, ly, rx, ry = self.vr3pt_keyboard_motion.virtual_axes()
 
             # Facing from RIGHT stick: continuous yaw based on rx (right = turn right, left = turn left)
             facing = self.yaw_accumulator.update(rx, self.dt)
@@ -1775,12 +1795,18 @@ class PlannerStreamer:
                 if mag > 1.0:
                     mag = 1.0
                 mode_to_send = self.mode
+                if stream_mode == StreamMode.PLANNER_VR_3PT:
+                    mode_to_send = resolve_vr3pt_locomotion_mode(
+                        mode_to_send,
+                        raw_mag=raw_mag,
+                        locomotion_mode_enum=LocomotionMode,
+                    )
 
                 if self.mode == LocomotionMode.SLOW_WALK:
                     speed = 0.1 + 0.5 * mag  # 0.1 .. 0.6
-                elif self.mode == LocomotionMode.WALK:
+                elif mode_to_send == LocomotionMode.WALK:
                     speed = -1.0
-                elif self.mode == LocomotionMode.RUN:
+                elif mode_to_send == LocomotionMode.RUN:
                     speed = 1.5 + 3 * mag  # 1.5 .. 4.5
                 else:
                     speed = mag  # default 0 .. 1.0
@@ -1799,8 +1825,6 @@ class PlannerStreamer:
             right_hand_position = None
             if stream_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
                 upper_body_position = self.feedback_reader.upper_body_position_target
-                left_hand_position = self.feedback_reader.left_hand_position_target
-                right_hand_position = self.feedback_reader.right_hand_position_target
 
             vr_3pt_position = None
             vr_3pt_orientation = None
@@ -1812,26 +1836,6 @@ class PlannerStreamer:
                     vr_3pt_pose = self.three_point.process_smpl_pose(sample["body_poses_np"])
                     vr_3pt_position = (vr_3pt_pose[:, :3].flatten()).tolist()
                     vr_3pt_orientation = vr_3pt_pose[:, 3:].flatten().tolist()
-
-                # Compute hand joints from trigger/grip inputs so operator can
-                # control hand open/close while in VR 3PT mode
-                (
-                    left_menu_button,
-                    left_trigger,
-                    right_trigger,
-                    left_grip,
-                    right_grip,
-                ) = get_controller_inputs()
-                lh_joints, rh_joints = compute_hand_joints_from_inputs(
-                    self.left_hand_ik_solver,
-                    self.right_hand_ik_solver,
-                    left_trigger,
-                    left_grip,
-                    right_trigger,
-                    right_grip,
-                )
-                left_hand_position = lh_joints.reshape(-1).astype(np.float32).tolist()
-                right_hand_position = rh_joints.reshape(-1).astype(np.float32).tolist()
 
             msg = build_planner_message(
                 mode_to_send.value,
@@ -1894,8 +1898,11 @@ def run_pico_manager(
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
     Controller input:
-      A+X: Toggle between planner and pose mode
-      A+B+X+Y: Toggle policy start/stop
+      Keyboard p: toggle planner on/off
+      Keyboard o: switch to pose mode
+      Keyboard f: switch to frozen-upper-body mode
+      Keyboard v: toggle VR_3PT from planner
+      A+B+X+Y: emergency stop policy
     """
     if xrt is None:
         raise ImportError(
@@ -2014,222 +2021,181 @@ def run_pico_manager(
         )
         print(f"[Manager] XR recorder enabled at: {task_dir}")
 
-    # State machine diagram:
+    # State machine summary:
     #
-    #   Chain 1 (by_pressed enters/exits, left_axis_click toggles sub-mode):
-    #     POSE <--(by)--> PLANNER_FROZEN_UPPER_BODY <--(left_axis_click)--> PLANNER_VR_3PT
-    #                                                                         |
-    #                                                                    (by)--> POSE
+    #   Keyboard:
+    #     p -> toggle PLANNER <-> OFF
+    #     o -> switch to POSE
+    #     f -> switch to PLANNER_FROZEN_UPPER_BODY
+    #     v -> POSE <-> PLANNER_VR_3PT
     #
-    #   Chain 2 (ax_pressed enters/exits, left_axis_click toggles sub-mode):
-    #     POSE <--(ax)--> PLANNER <--(left_axis_click)--> PLANNER_VR_3PT
-    #                                                        |
-    #                                                   (ax)--> POSE
+    #   Emergency stop from any active mode:
+    #     A+B+X+Y -> OFF
     #
-    #   Emergency stop from any mode: A+B+X+Y (start_combo) --> OFF
-    #   POSE_PAUSE: left_menu_button held --> POSE_PAUSE, released --> POSE
+    #   POSE pause:
+    #     hold left_menu_button -> POSE_PAUSE, release -> POSE
     #
-    print("Manager controls: A+X=toggle mode, A+B+X+Y=start/stop policy")
+    print(f"Manager controls: {KEYBOARD_MODE_HELP}, A+B+X+Y=emergency stop")
     current_mode = StreamMode.OFF
-    # Track which mode VR_3PT was entered from, so left_axis_click returns to it.
-    # Will be either PLANNER or PLANNER_FROZEN_UPPER_BODY.
-    vr3pt_parent_mode = StreamMode.PLANNER
     try:
-        prev_ax_pressed = False
-        prev_by_pressed = False
         prev_start_combo = False
-        prev_left_axis_click = False
         prev_record_collection = False
         prev_record_abort = False
-        while True:
+        with ConsoleKeyMonitor() as key_monitor:
+            while True:
             # Poll Pico controller for buttons/axes
-            a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons()
+                a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons()
+                keyboard_key = consume_latest_keyboard_key(key_monitor.read_key)
+                planner_streamer.observe_keyboard_key(keyboard_key)
 
-            left_menu_button, _, _, _, _ = get_controller_inputs()
+                left_menu_button, _, _, _, _ = get_controller_inputs()
 
-            record_collection_pressed = bool(a_pressed)
-            record_abort_pressed = bool(b_pressed)
-            toggle_data_collection = record_collection_pressed and not prev_record_collection
-            toggle_data_abort = record_abort_pressed and not prev_record_abort
+                record_collection_pressed = bool(a_pressed)
+                record_abort_pressed = bool(b_pressed)
+                toggle_data_collection = record_collection_pressed and not prev_record_collection
+                toggle_data_abort = record_abort_pressed and not prev_record_abort
 
-            if xr_feedback_poller is not None and xr_decode_feedback is not None and xr_recorder is not None:
-                feedback_data = xr_feedback_poller.get_data()
-                if feedback_data is not None:
+                if xr_feedback_poller is not None and xr_decode_feedback is not None and xr_recorder is not None:
+                    feedback_data = xr_feedback_poller.get_data()
+                    if feedback_data is not None:
+                        try:
+                            xr_recorder.observe_feedback(xr_decode_feedback(feedback_data))
+                        except Exception as exc:
+                            print(f"[Manager] XR recorder feedback decode failed: {exc}")
+
+                if xr_recorder is not None:
+                    if toggle_data_abort:
+                        if xr_recorder.toggle_abort():
+                            print("[Manager] XR recorder aborted current episode")
+                    elif toggle_data_collection:
+                        was_recording = xr_recorder.is_recording
+                        is_recording = xr_recorder.toggle_collection()
+                        if not was_recording and is_recording:
+                            print("[Manager] XR recorder started episode")
+                        elif was_recording and not xr_recorder.is_recording:
+                            print("[Manager] XR recorder saved episode")
+
+                # Feed PICO hand tracking to Inspire controller
+                if inspire_controller is not None or raw_hand_visualizer is not None:
                     try:
-                        xr_recorder.observe_feedback(xr_decode_feedback(feedback_data))
-                    except Exception as exc:
-                        print(f"[Manager] XR recorder feedback decode failed: {exc}")
+                        left_active = xrt.get_left_hand_is_active()
+                        right_active = xrt.get_right_hand_is_active()
+                        left_ht = xrt.get_left_hand_tracking_state() if left_active else None
+                        right_ht = xrt.get_right_hand_tracking_state() if right_active else None
+                        if raw_hand_visualizer is not None and raw_hand_visualizer.is_open:
+                            raw_hand_visualizer.update_hands(left_ht, right_ht)
+                            raw_hand_visualizer.render()
+                        if (
+                            inspire_controller is not None
+                            and left_ht is not None
+                            and right_ht is not None
+                        ):
+                            # XRoboToolkit exposes controller poses, not the dedicated arm-frame
+                            # used by the upstream Quest/WebXR teleop stack. Passing controller
+                            # poses here distorts the retargeting input more than helping, so keep
+                            # the hand preprocessing in the wrist-local path unless a real arm pose
+                            # source becomes available.
+                            inspire_controller.update(left_ht, right_ht)
+                    except Exception as e:
+                        print(f"[Manager] Hand tracking error: {e}")
 
-            if xr_recorder is not None:
-                if toggle_data_abort:
-                    if xr_recorder.toggle_abort():
-                        print("[Manager] XR recorder aborted current episode")
-                elif toggle_data_collection:
-                    was_recording = xr_recorder.is_recording
-                    is_recording = xr_recorder.toggle_collection()
-                    if not was_recording and is_recording:
-                        print("[Manager] XR recorder started episode")
-                    elif was_recording and not xr_recorder.is_recording:
-                        print("[Manager] XR recorder saved episode")
+                # Rising edge: A+B+X+Y pressed together -> emergency stop policy
+                start_combo = (a_pressed) and (b_pressed) and (x_pressed) and (y_pressed)
+                keyboard_mode = next_mode_from_keyboard(current_mode, keyboard_key, StreamMode)
 
-            left_axis_click, _ = get_axis_clicks()
+                new_mode = current_mode
+                if keyboard_mode != current_mode:
+                    new_mode = keyboard_mode
+                    if new_mode == StreamMode.PLANNER and current_mode == StreamMode.OFF:
+                        sample = reader.get_latest()
+                        if sample is not None:
+                            three_point.calibrate_now(sample["body_poses_np"])
+                        else:
+                            print("[Manager] WARNING: No SMPL data available for calibration")
+                elif current_mode == StreamMode.OFF:
+                    new_mode = current_mode
 
-            # Feed PICO hand tracking to Inspire controller
-            if inspire_controller is not None or raw_hand_visualizer is not None:
-                try:
-                    left_active = xrt.get_left_hand_is_active()
-                    right_active = xrt.get_right_hand_is_active()
-                    left_ht = xrt.get_left_hand_tracking_state() if left_active else None
-                    right_ht = xrt.get_right_hand_tracking_state() if right_active else None
-                    if raw_hand_visualizer is not None and raw_hand_visualizer.is_open:
-                        raw_hand_visualizer.update_hands(left_ht, right_ht)
-                        raw_hand_visualizer.render()
-                    if (
-                        inspire_controller is not None
-                        and left_ht is not None
-                        and right_ht is not None
-                    ):
-                        # XRoboToolkit exposes controller poses, not the dedicated arm-frame
-                        # used by the upstream Quest/WebXR teleop stack. Passing controller
-                        # poses here distorts the retargeting input more than helping, so keep
-                        # the hand preprocessing in the wrist-local path unless a real arm pose
-                        # source becomes available.
-                        inspire_controller.update(left_ht, right_ht)
-                except Exception as e:
-                    print(f"[Manager] Hand tracking error: {e}")
+                elif current_mode == StreamMode.PLANNER:
+                    if start_combo and not prev_start_combo:
+                        new_mode = StreamMode.OFF
 
-            # Rising edge: A+X pressed together -> toggle POSE/PLANNER mode
-            ax_pressed = (a_pressed) and (x_pressed)
+                elif current_mode == StreamMode.POSE:
+                    if start_combo and not prev_start_combo:
+                        new_mode = StreamMode.OFF
+                    elif left_menu_button:
+                        new_mode = StreamMode.POSE_PAUSE
 
-            # Rising edge: B+Y pressed together -> toggle POSE/PLANNER_FROZEN_UPPER_BODY mode
-            by_pressed = (b_pressed) and (y_pressed)
+                elif current_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
+                    if start_combo and not prev_start_combo:
+                        new_mode = StreamMode.OFF
 
-            # Rising edge: A+B+X+Y pressed together -> toggle policy start/stop (planner=True)
-            start_combo = (a_pressed) and (b_pressed) and (x_pressed) and (y_pressed)
+                elif current_mode == StreamMode.POSE_PAUSE:
+                    if start_combo and not prev_start_combo:
+                        new_mode = StreamMode.OFF
+                    elif not left_menu_button:
+                        new_mode = StreamMode.POSE
 
+                elif current_mode == StreamMode.PLANNER_VR_3PT:
+                    if start_combo and not prev_start_combo:
+                        new_mode = StreamMode.OFF
 
-            new_mode = current_mode
-            if current_mode == StreamMode.OFF:
-                if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.PLANNER
-                    # Calibrate VR 3pt tracking NOW: operator should be in zero-ref pose.
-                    # Uses the current Pico SMPL frame + FK of all-zero body joints.
-                    sample = reader.get_latest()
-                    if sample is not None:
-                        three_point.calibrate_now(sample["body_poses_np"])
-                    else:
-                        print("[Manager] WARNING: No SMPL data available for calibration")
+                # Handle mode transitions before running loop
+                if new_mode != current_mode:
+                    if current_mode == StreamMode.POSE:
+                        pose_streamer.on_mode_exit()
 
-            elif current_mode == StreamMode.PLANNER:
-                # Chain 2: POSE <--(ax)--> PLANNER <--(left_axis_click)--> VR_3PT
-                if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.OFF
-                elif ax_pressed and not prev_ax_pressed:
-                    new_mode = StreamMode.POSE
-                elif left_axis_click and not prev_left_axis_click:
-                    new_mode = StreamMode.PLANNER_VR_3PT
-
-            elif current_mode == StreamMode.POSE:
-                if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.OFF
-                elif ax_pressed and not prev_ax_pressed:
-                    new_mode = StreamMode.PLANNER  # Enter chain 2
-                elif by_pressed and not prev_by_pressed:
-                    new_mode = StreamMode.PLANNER_FROZEN_UPPER_BODY  # Enter chain 1
-                elif left_menu_button:
-                    new_mode = StreamMode.POSE_PAUSE
-
-            elif current_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
-                # Chain 1: POSE <--(by)--> FROZEN <--(left_axis_click)--> VR_3PT
-                if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.OFF
-                elif by_pressed and not prev_by_pressed:
-                    new_mode = StreamMode.POSE
-                elif left_axis_click and not prev_left_axis_click:
-                    new_mode = StreamMode.PLANNER_VR_3PT
-
-            elif current_mode == StreamMode.POSE_PAUSE:
-                if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.OFF
-                elif not left_menu_button:
-                    new_mode = StreamMode.POSE
-
-            elif current_mode == StreamMode.PLANNER_VR_3PT:
-                # VR_3PT is reachable from both chains:
-                #   left_axis_click → return to parent (PLANNER or FROZEN)
-                #   ax_pressed      → POSE (chain 2 exit)
-                #   by_pressed      → POSE (chain 1 exit)
-                if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.OFF
-                elif left_axis_click and not prev_left_axis_click:
-                    new_mode = vr3pt_parent_mode  # Return to parent mode
-                elif ax_pressed and not prev_ax_pressed:
-                    new_mode = StreamMode.POSE
-                elif by_pressed and not prev_by_pressed:
-                    new_mode = StreamMode.POSE
-
-            # Handle mode transitions before running loop
-            if new_mode != current_mode:
-                if current_mode == StreamMode.POSE:
-                    pose_streamer.on_mode_exit()
-
-                # Track parent when entering VR_3PT
-                if new_mode == StreamMode.PLANNER_VR_3PT:
-                    vr3pt_parent_mode = current_mode
-                    print(f"[Manager] VR_3PT parent: {vr3pt_parent_mode.name}")
-
-                if new_mode == StreamMode.POSE:
-                    pose_streamer.reset_yaw()
-                elif new_mode == StreamMode.PLANNER and current_mode != StreamMode.PLANNER_VR_3PT:
-                    # Only reset yaw when freshly entering PLANNER from POSE,
-                    # not when returning from VR_3PT sub-mode
-                    planner_streamer.reset_yaw()
-                elif new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
-                    if current_mode != StreamMode.PLANNER_VR_3PT:
-                        # Freshly entering from POSE: reset yaw and grab initial targets
+                    if new_mode == StreamMode.POSE:
+                        pose_streamer.reset_yaw()
+                    elif new_mode == StreamMode.PLANNER and current_mode != StreamMode.PLANNER_VR_3PT:
+                        # Only reset yaw when freshly entering PLANNER from POSE,
+                        # not when returning from VR_3PT sub-mode
                         planner_streamer.reset_yaw()
-                    # Always re-grab the latest robot state as frozen targets,
-                    # whether entering from POSE or returning from VR_3PT
-                    # (the old targets are stale after VR_3PT moved the arms)
-                    planner_streamer.save_upper_body_position_target()
-                elif new_mode == StreamMode.PLANNER_VR_3PT:
-                    # Recalibrate VR tracking against the robot's actual current pose
-                    # (read via g1_debug feedback + FK) to prevent sudden jumps
-                    planner_streamer.recalibrate_for_vr3pt()
+                    elif new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY:
+                        if current_mode != StreamMode.PLANNER_VR_3PT:
+                            # Freshly entering from POSE: reset yaw and grab initial targets
+                            planner_streamer.reset_yaw()
+                        # Always re-grab the latest robot state as frozen targets,
+                        # whether entering from POSE or returning from VR_3PT
+                        # (the old targets are stale after VR_3PT moved the arms)
+                        planner_streamer.save_upper_body_position_target()
+                    elif new_mode == StreamMode.PLANNER_VR_3PT:
+                        # Recalibrate VR tracking against the robot's actual current pose
+                        # (read via g1_debug feedback + FK) to prevent sudden jumps
+                        planner_streamer.recalibrate_for_vr3pt()
 
-            # Run one iteration of the new mode
-            if new_mode == StreamMode.POSE:
-                pose_streamer.run_once()
-            elif (
-                new_mode == StreamMode.PLANNER
-                or new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY
-                or new_mode == StreamMode.PLANNER_VR_3PT
-            ):
-                planner_streamer.run_once(new_mode)
-
-            # Make sure to send command messages after loop iteration to ensure data arrives before mode switch
-            if new_mode != current_mode:
-                if new_mode == StreamMode.OFF:
-                    socket.send(build_command_message(start=False, stop=True, planner=True))
-                    exit()
+                # Run one iteration of the new mode
+                pose_streamer.hand_control_enabled = hand_control_enabled_for_mode(
+                    new_mode, StreamMode
+                )
+                if new_mode == StreamMode.POSE:
+                    pose_streamer.run_once()
                 elif (
                     new_mode == StreamMode.PLANNER
                     or new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY
                     or new_mode == StreamMode.PLANNER_VR_3PT
                 ):
-                    socket.send(build_command_message(start=True, stop=False, planner=True))
-                elif new_mode == StreamMode.POSE:
-                    socket.send(build_command_message(start=True, stop=False, planner=False))
+                    planner_streamer.run_once(new_mode)
 
-                print(f"[Manager] StreamMode switch: {current_mode.name} -> {new_mode.name}")
-                current_mode = new_mode
+                # Make sure to send command messages after loop iteration to ensure data arrives before mode switch
+                if new_mode != current_mode:
+                    if new_mode == StreamMode.OFF:
+                        socket.send(build_command_message(start=False, stop=True, planner=True))
+                        exit()
+                    elif (
+                        new_mode == StreamMode.PLANNER
+                        or new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY
+                        or new_mode == StreamMode.PLANNER_VR_3PT
+                    ):
+                        socket.send(build_command_message(start=True, stop=False, planner=True))
+                    elif new_mode == StreamMode.POSE:
+                        socket.send(build_command_message(start=True, stop=False, planner=False))
 
-            prev_ax_pressed = ax_pressed
-            prev_by_pressed = by_pressed
-            prev_start_combo = start_combo
-            prev_left_axis_click = left_axis_click
-            prev_record_collection = record_collection_pressed
-            prev_record_abort = record_abort_pressed
+                    print(f"[Manager] StreamMode switch: {current_mode.name} -> {new_mode.name}")
+                    current_mode = new_mode
+
+                prev_start_combo = start_combo
+                prev_record_collection = record_collection_pressed
+                prev_record_abort = record_abort_pressed
 
     except KeyboardInterrupt:
         print("\nStopping manager...")
