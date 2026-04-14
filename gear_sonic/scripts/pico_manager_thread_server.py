@@ -44,7 +44,11 @@ from gear_sonic.utils.teleop.manager_mode_controls import (
     VR3PTKeyboardMotion,
     consume_latest_keyboard_key,
     hand_control_enabled_for_mode,
+    next_mode_from_controller,
     next_mode_from_keyboard,
+    resolve_recording_shortcuts,
+    resolve_vr3pt_default_speed,
+    resolve_vr3pt_motion_axes,
     resolve_vr3pt_locomotion_mode,
 )
 
@@ -1701,6 +1705,7 @@ class PlannerStreamer:
         poll_hz: int = 20,
         zmq_feedback_host: str = "localhost",
         zmq_feedback_port: int = 5557,
+        vr3pt_locomotion_source: str = "keyboard",
     ):
         self.socket = socket
         self.reader = reader
@@ -1708,6 +1713,7 @@ class PlannerStreamer:
         self.feedback_reader = FeedbackReader(
             zmq_feedback_host=zmq_feedback_host, zmq_feedback_port=zmq_feedback_port
         )
+        self.vr3pt_locomotion_source = vr3pt_locomotion_source
 
         self.dt = 1.0 / max(1, poll_hz)
         # Current locomotion mode, default IDLE
@@ -1777,9 +1783,15 @@ class PlannerStreamer:
             self.prev_xy = xy_now
 
             # Read axes/joysticks to control movement, facing, speed and mode
-            lx, ly, rx, ry = get_controller_axes()
-            if stream_mode == StreamMode.PLANNER_VR_3PT:
-                lx, ly, rx, ry = self.vr3pt_keyboard_motion.virtual_axes()
+            controller_axes = get_controller_axes()
+            keyboard_axes = self.vr3pt_keyboard_motion.virtual_axes()
+            lx, ly, rx, ry = resolve_vr3pt_motion_axes(
+                stream_mode=stream_mode,
+                locomotion_source=self.vr3pt_locomotion_source,
+                controller_axes=controller_axes,
+                keyboard_axes=keyboard_axes,
+                vr3pt_mode=StreamMode.PLANNER_VR_3PT,
+            )
 
             # Facing from RIGHT stick: continuous yaw based on rx (right = turn right, left = turn left)
             facing = self.yaw_accumulator.update(rx, self.dt)
@@ -1802,7 +1814,14 @@ class PlannerStreamer:
                         locomotion_mode_enum=LocomotionMode,
                     )
 
-                if self.mode == LocomotionMode.SLOW_WALK:
+                if stream_mode == StreamMode.PLANNER_VR_3PT:
+                    speed = resolve_vr3pt_default_speed(
+                        requested_mode=self.mode,
+                        effective_mode=mode_to_send,
+                        mag=mag,
+                        vr3pt_default_mode=LocomotionMode.SLOW_WALK,
+                    )
+                elif self.mode == LocomotionMode.SLOW_WALK:
                     speed = 0.1 + 0.5 * mag  # 0.1 .. 0.6
                 elif mode_to_send == LocomotionMode.WALK:
                     speed = -1.0
@@ -1893,6 +1912,7 @@ def run_pico_manager(
     camera_host: str = "192.168.123.164",
     camera_port: int = 60000,
     enable_depth: bool = False,
+    vr3pt_locomotion_source: str = "keyboard",
     # auto_pose_delay: float | None = None,
 ):
     """
@@ -1996,6 +2016,7 @@ def run_pico_manager(
         poll_hz=20,
         zmq_feedback_host=zmq_feedback_host,
         zmq_feedback_port=zmq_feedback_port,
+        vr3pt_locomotion_source=vr3pt_locomotion_source,
     )
 
     xr_recorder = None
@@ -2038,6 +2059,8 @@ def run_pico_manager(
     print(f"Manager controls: {KEYBOARD_MODE_HELP}, A+B+X+Y=emergency stop")
     current_mode = StreamMode.OFF
     try:
+        prev_ax_pressed = False
+        prev_left_axis_click = False
         prev_start_combo = False
         prev_record_collection = False
         prev_record_abort = False
@@ -2049,11 +2072,17 @@ def run_pico_manager(
                 planner_streamer.observe_keyboard_key(keyboard_key)
 
                 left_menu_button, _, _, _, _ = get_controller_inputs()
+                left_axis_click, _ = get_axis_clicks()
 
                 record_collection_pressed = bool(a_pressed)
                 record_abort_pressed = bool(b_pressed)
-                toggle_data_collection = record_collection_pressed and not prev_record_collection
-                toggle_data_abort = record_abort_pressed and not prev_record_abort
+                toggle_data_collection, toggle_data_abort = resolve_recording_shortcuts(
+                    key=keyboard_key,
+                    controller_collection_pressed=record_collection_pressed,
+                    controller_abort_pressed=record_abort_pressed,
+                    prev_controller_collection=prev_record_collection,
+                    prev_controller_abort=prev_record_abort,
+                )
 
                 if xr_feedback_poller is not None and xr_decode_feedback is not None and xr_recorder is not None:
                     feedback_data = xr_feedback_poller.get_data()
@@ -2101,10 +2130,22 @@ def run_pico_manager(
 
                 # Rising edge: A+B+X+Y pressed together -> emergency stop policy
                 start_combo = (a_pressed) and (b_pressed) and (x_pressed) and (y_pressed)
+                ax_pressed = (a_pressed) and (x_pressed) and (not prev_ax_pressed)
                 keyboard_mode = next_mode_from_keyboard(current_mode, keyboard_key, StreamMode)
+                controller_mode = next_mode_from_controller(
+                    current_mode,
+                    controller_shortcuts_enabled=(vr3pt_locomotion_source == "controller"),
+                    ax_pressed=ax_pressed,
+                    left_axis_click=left_axis_click and (not prev_left_axis_click),
+                    stream_mode_enum=StreamMode,
+                )
 
                 new_mode = current_mode
-                if keyboard_mode != current_mode:
+                if controller_mode != current_mode:
+                    new_mode = controller_mode
+                    if new_mode == StreamMode.POSE and current_mode == StreamMode.OFF:
+                        pose_streamer.reset_yaw()
+                elif keyboard_mode != current_mode:
                     new_mode = keyboard_mode
                     if new_mode == StreamMode.PLANNER and current_mode == StreamMode.OFF:
                         sample = reader.get_latest()
@@ -2194,6 +2235,8 @@ def run_pico_manager(
                     current_mode = new_mode
 
                 prev_start_combo = start_combo
+                prev_ax_pressed = (a_pressed) and (x_pressed)
+                prev_left_axis_click = left_axis_click
                 prev_record_collection = record_collection_pressed
                 prev_record_abort = record_abort_pressed
 
@@ -2364,6 +2407,13 @@ if __name__ == "__main__":
         action="store_true",
         help="Record head depth frames alongside RGB when xr-style recording is enabled",
     )
+    parser.add_argument(
+        "--vr3pt-locomotion-source",
+        type=str,
+        choices=["keyboard", "controller"],
+        default="keyboard",
+        help="Lower-body locomotion source in PLANNER_VR_3PT: keyboard (default) or controller",
+    )
     args = parser.parse_args()
 
     # Standalone VR3Pt test modes (exit after finishing)
@@ -2417,6 +2467,7 @@ if __name__ == "__main__":
             camera_host=args.camera_host,
             camera_port=args.camera_port,
             enable_depth=args.enable_depth,
+            vr3pt_locomotion_source=args.vr3pt_locomotion_source,
             # auto_pose_delay=args.auto_pose_delay,
         )
     else:

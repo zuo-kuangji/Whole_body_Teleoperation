@@ -93,6 +93,14 @@ dex_retargeting           0.4.7             /home/g1/zuo/xr_teleoperate/teleop/r
 (tv) unitree@Host:~/xr_teleoperate$ pip install -r requirements.txt
 
 #####################################################
+PICO 遥操（Inspire 手）和录制
+
+核心脚本位置
+- 遥操输入与状态机: `gear_sonic/scripts/pico_manager_thread_server.py`
+- 录制桥接: `episode_writter/gear_sonic_bridge.py`
+- episode 落盘: `episode_writter/episode_writer.py`
+- MuJoCo 回放: `gear_sonic/scripts/replay_episode_mujoco.py`
+
 仿真模式（Inspire 手）— 3 个 Terminal
 
 # Terminal 1 — MuJoCo 仿真器
@@ -104,37 +112,109 @@ cd gear_sonic_deploy
 source scripts/setup_env.sh
 bash deploy.sh --input-type zmq_manager sim
 
-# Terminal 3 — PICO 遥操（全身 + Inspire 手）
+# Terminal 3 — PICO 遥操（键盘主模式）
+cd /home/g1/hsj/GR00T-WholeBodyControl
 source .venv_teleop/bin/activate
 python gear_sonic/scripts/pico_manager_thread_server.py \
-    --manager --hand-type inspire --hand-sim --vis_raw_hand --task-dir /tmp/ep_test --inspire-transport dfx
+    --manager --hand-type inspire --hand-sim --inspire-transport dfx
 
-
-真机模式（Inspire 手）— 2 个 Terminal
-
-# Terminal 1
+======================================
+======================================
+#真机模式（Inspire 手）— 2 个 Terminal#
+======================================
+======================================
+# Terminal 1 — 真机控制
 cd /home/g1/hsj/GR00T-WholeBodyControl/gear_sonic_deploy
 export TensorRT_ROOT=$HOME/TensorRT
 source scripts/setup_env.sh
 bash deploy.sh --input-type zmq_manager real
 
-# Terminal 2
+# Terminal 2 — PICO 遥操（键盘主模式 + 录制）
 cd /home/g1/hsj/GR00T-WholeBodyControl
 source .venv_teleop/bin/activate
 python gear_sonic/scripts/pico_manager_thread_server.py \
-    --manager --hand-type inspire --task-dir /tmp/ep_test --inspire-transport ftp
+    --manager \
+    --hand-type inspire \
+    --inspire-transport ftp \
+    --task-dir /home/g1/hsj/HRI_Datasets/Handover \
+    --task-name Handover_Starbucks \
+    --task-goal "Pick up the object." \
+    --task-desc "Pick up the object." \
+    --task-steps "step1: reach. step2: grasp. step3: place."
 
-python gear_sonic/scripts/pico_manager_thread_server.py \
-    --manager --hand-type inspire --task-dir /tmp/ep_test --inspire-transport dfx
-
-
-render 采集数据
+# 如果只想遥操，不录制
+cd /home/g1/hsj/GR00T-WholeBodyControl
 source .venv_teleop/bin/activate
-python gear_sonic/scripts/replay_episode_mujoco.py --episode /home/g1/hsj/tmp/episode_0002
+python gear_sonic/scripts/pico_manager_thread_server.py \
+    --manager \
+    --hand-type inspire \
+    --inspire-transport ftp
+
+# 如果仍想用 controller 做 VR_3PT 下半身
+cd /home/g1/hsj/GR00T-WholeBodyControl
+source .venv_teleop/bin/activate
+python gear_sonic/scripts/pico_manager_thread_server.py \
+    --manager \
+    --hand-type inspire \
+    --inspire-transport dfx \
+    --vr3pt-locomotion-source controller
 
 
+键盘主模式操作
+- `p`: `PLANNER <-> OFF`
+- `o`: 切到 `POSE`
+- `f`: 切到 `PLANNER_FROZEN_UPPER_BODY`
+- `v`: `POSE <-> PLANNER_VR_3PT`
+- `w/s/a/d/q/e`: `PLANNER_VR_3PT` 下半身控制
+- `r`: 开始/结束当前 episode 录制
+- `x`: 丢弃当前 episode
 
-键盘操作：
-p：进入planner
-o：进入全身遥操
-v：进入键盘控制下半身的遥操
+当前模式语义
+- `POSE`: 全身遥操，且手部控制启用
+- `PLANNER`: 下半身 planner 模式
+- `PLANNER_FROZEN_UPPER_BODY`: 上半身冻结，只走 planner
+- `PLANNER_VR_3PT`: 上半身 3 点跟踪，下半身走键盘或 controller
+
+VR_3PT 默认速度
+- 现在默认是 `SLOW_WALK + 0.8 m/s`
+- 这比之前的 `WALK` 默认速度更保守
+
+控制器保留的兼容操作
+- `A`: 开始/结束当前 episode 录制
+- `B`: 丢弃当前 episode
+- `A+B+X+Y`: 紧急停止，并让 manager 退出
+- 如果带了 `--vr3pt-locomotion-source controller`
+  `PLANNER_VR_3PT` 下半身改成控制器摇杆，键盘 `wasd/qe` 不再生效
+
+录制文件保存位置
+- 推荐根目录: `/home/g1/hsj/HRI_Datasets`
+- 如果带 `--task-name try_out`
+  episode 会落到: `/home/g1/hsj/HRI_Datasets/try_out/episode_0000`
+
+现在会记录什么
+- `colors/`: 相机 RGB 图像
+- `depths/`: 深度图
+- `data.json`: 每一帧的状态和动作
+
+`data.json` 当前主要内容
+- `states.left_arm/right_arm.qpos qvel`
+- `states.left_ee/right_ee.qpos qvel`
+- `states.body.qpos qvel`
+- `states.body.feedback_index`
+- `states.body.ros_timestamp`
+- `actions.left_arm/right_arm.qpos`
+- `actions.left_ee/right_ee.qpos`
+- `actions.body.qpos`
+
+更准确地说
+- `states` 来自机器人反馈
+- `actions` 来自 `g1_debug` 里的 `last_action` 和手部 action
+- 开启录制时，如果相机可用，还会同步拉 head/wrist 图像
+
+如果不想录相机，只录机器人状态和动作
+- 在 Terminal 2 命令后面加 `--disable-camera`
+
+回放录制结果
+source .venv_teleop/bin/activate
+python gear_sonic/scripts/replay_episode_mujoco.py \
+    --episode /home/g1/hsj/HRI_Datasets/try_out/episode_0000

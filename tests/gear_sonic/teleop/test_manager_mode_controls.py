@@ -5,6 +5,10 @@ from gear_sonic.utils.teleop.manager_mode_controls import (
     VR3PTKeyboardMotion,
     consume_latest_keyboard_key,
     hand_control_enabled_for_mode,
+    next_mode_from_controller,
+    resolve_recording_shortcuts,
+    resolve_vr3pt_default_speed,
+    resolve_vr3pt_motion_axes,
     resolve_vr3pt_locomotion_mode,
     next_mode_from_keyboard,
 )
@@ -24,6 +28,11 @@ class _Loco(IntEnum):
     SLOW_WALK = 1
     WALK = 2
     RUN = 3
+
+
+class _StreamMode(Enum):
+    POSE = 1
+    PLANNER_VR_3PT = 5
 
 
 class ManagerModeControlsTest(unittest.TestCase):
@@ -68,7 +77,63 @@ class ManagerModeControlsTest(unittest.TestCase):
 
     def test_unmapped_key_keeps_current_mode(self):
         self.assertEqual(next_mode_from_keyboard(_Mode.POSE, None, _Mode), _Mode.POSE)
-        self.assertEqual(next_mode_from_keyboard(_Mode.POSE, "x", _Mode), _Mode.POSE)
+        self.assertEqual(next_mode_from_keyboard(_Mode.POSE, "z", _Mode), _Mode.POSE)
+
+    def test_keyboard_record_shortcuts_toggle_collection_and_abort(self):
+        self.assertEqual(
+            resolve_recording_shortcuts(
+                key="r",
+                controller_collection_pressed=False,
+                controller_abort_pressed=False,
+                prev_controller_collection=False,
+                prev_controller_abort=False,
+            ),
+            (True, False),
+        )
+        self.assertEqual(
+            resolve_recording_shortcuts(
+                key="x",
+                controller_collection_pressed=False,
+                controller_abort_pressed=False,
+                prev_controller_collection=False,
+                prev_controller_abort=False,
+            ),
+            (False, True),
+        )
+
+    def test_controller_record_shortcuts_remain_available_as_fallback(self):
+        self.assertEqual(
+            resolve_recording_shortcuts(
+                key=None,
+                controller_collection_pressed=True,
+                controller_abort_pressed=False,
+                prev_controller_collection=False,
+                prev_controller_abort=False,
+            ),
+            (True, False),
+        )
+        self.assertEqual(
+            resolve_recording_shortcuts(
+                key=None,
+                controller_collection_pressed=False,
+                controller_abort_pressed=True,
+                prev_controller_collection=False,
+                prev_controller_abort=False,
+            ),
+            (False, True),
+        )
+
+    def test_controller_record_shortcuts_still_use_rising_edges(self):
+        self.assertEqual(
+            resolve_recording_shortcuts(
+                key=None,
+                controller_collection_pressed=True,
+                controller_abort_pressed=True,
+                prev_controller_collection=True,
+                prev_controller_abort=True,
+            ),
+            (False, False),
+        )
 
     def test_only_pose_mode_enables_hand_control(self):
         self.assertFalse(hand_control_enabled_for_mode(_Mode.OFF, _Mode))
@@ -108,10 +173,34 @@ class ManagerModeControlsTest(unittest.TestCase):
         motion.observe_key("p")
         self.assertEqual(motion.virtual_axes(), (0.0, 0.0, 0.0, 0.0))
 
-    def test_vr3pt_uses_walk_when_keyboard_motion_is_active_from_idle(self):
+    def test_vr3pt_uses_slow_walk_when_keyboard_motion_is_active_from_idle(self):
         self.assertEqual(
             resolve_vr3pt_locomotion_mode(_Loco.IDLE, raw_mag=1.0, locomotion_mode_enum=_Loco),
-            _Loco.WALK,
+            _Loco.SLOW_WALK,
+        )
+
+    def test_vr3pt_uses_fixed_default_speed_when_falling_back_to_slow_walk(self):
+        self.assertEqual(
+            resolve_vr3pt_default_speed(
+                requested_mode=_Loco.IDLE,
+                effective_mode=_Loco.SLOW_WALK,
+                mag=1.0,
+                vr3pt_default_mode=_Loco.SLOW_WALK,
+                vr3pt_default_speed=0.8,
+            ),
+            0.8,
+        )
+
+    def test_vr3pt_keeps_explicit_slow_walk_speed_curve_after_mode_change(self):
+        self.assertAlmostEqual(
+            resolve_vr3pt_default_speed(
+                requested_mode=_Loco.SLOW_WALK,
+                effective_mode=_Loco.SLOW_WALK,
+                mag=0.5,
+                vr3pt_default_mode=_Loco.SLOW_WALK,
+                vr3pt_default_speed=0.8,
+            ),
+            0.35,
         )
 
     def test_vr3pt_preserves_non_idle_mode_when_keyboard_motion_is_active(self):
@@ -136,6 +225,110 @@ class ManagerModeControlsTest(unittest.TestCase):
         self.assertEqual(
             consume_latest_keyboard_key(iter(["o", "v"]).__next__),
             "v",
+        )
+
+    def test_resolve_vr3pt_motion_axes_uses_keyboard_by_default(self):
+        self.assertEqual(
+            resolve_vr3pt_motion_axes(
+                stream_mode=_StreamMode.PLANNER_VR_3PT,
+                locomotion_source="keyboard",
+                controller_axes=(0.2, 0.3, 0.4, 0.5),
+                keyboard_axes=(1.0, 0.0, -1.0, 0.0),
+                vr3pt_mode=_StreamMode.PLANNER_VR_3PT,
+            ),
+            (1.0, 0.0, -1.0, 0.0),
+        )
+
+    def test_resolve_vr3pt_motion_axes_can_use_controller(self):
+        self.assertEqual(
+            resolve_vr3pt_motion_axes(
+                stream_mode=_StreamMode.PLANNER_VR_3PT,
+                locomotion_source="controller",
+                controller_axes=(0.2, 0.3, 0.4, 0.5),
+                keyboard_axes=(1.0, 0.0, -1.0, 0.0),
+                vr3pt_mode=_StreamMode.PLANNER_VR_3PT,
+            ),
+            (0.2, 0.3, 0.4, 0.5),
+        )
+
+    def test_resolve_vr3pt_motion_axes_keeps_controller_outside_vr3pt(self):
+        self.assertEqual(
+            resolve_vr3pt_motion_axes(
+                stream_mode=_StreamMode.POSE,
+                locomotion_source="keyboard",
+                controller_axes=(0.2, 0.3, 0.4, 0.5),
+                keyboard_axes=(1.0, 0.0, -1.0, 0.0),
+                vr3pt_mode=_StreamMode.PLANNER_VR_3PT,
+            ),
+            (0.2, 0.3, 0.4, 0.5),
+        )
+
+    def test_controller_shortcuts_can_enter_pose_from_off(self):
+        self.assertEqual(
+            next_mode_from_controller(
+                _Mode.OFF,
+                controller_shortcuts_enabled=True,
+                ax_pressed=True,
+                left_axis_click=False,
+                stream_mode_enum=_Mode,
+            ),
+            _Mode.POSE,
+        )
+
+    def test_controller_shortcuts_toggle_pose_and_planner_with_ax(self):
+        self.assertEqual(
+            next_mode_from_controller(
+                _Mode.POSE,
+                controller_shortcuts_enabled=True,
+                ax_pressed=True,
+                left_axis_click=False,
+                stream_mode_enum=_Mode,
+            ),
+            _Mode.PLANNER,
+        )
+        self.assertEqual(
+            next_mode_from_controller(
+                _Mode.PLANNER,
+                controller_shortcuts_enabled=True,
+                ax_pressed=True,
+                left_axis_click=False,
+                stream_mode_enum=_Mode,
+            ),
+            _Mode.POSE,
+        )
+
+    def test_controller_shortcuts_toggle_pose_and_vr3pt_with_left_axis_click(self):
+        self.assertEqual(
+            next_mode_from_controller(
+                _Mode.POSE,
+                controller_shortcuts_enabled=True,
+                ax_pressed=False,
+                left_axis_click=True,
+                stream_mode_enum=_Mode,
+            ),
+            _Mode.PLANNER_VR_3PT,
+        )
+        self.assertEqual(
+            next_mode_from_controller(
+                _Mode.PLANNER_VR_3PT,
+                controller_shortcuts_enabled=True,
+                ax_pressed=False,
+                left_axis_click=True,
+                stream_mode_enum=_Mode,
+            ),
+            _Mode.POSE,
+        )
+
+    def test_controller_shortcuts_disabled_are_noops(self):
+        self.assertEqual(
+            next_mode_from_controller(
+                _Mode.POSE,
+                controller_shortcuts_enabled=False,
+                ax_pressed=True,
+                left_axis_click=True,
+                stream_mode_enum=_Mode,
+            ),
+            _Mode.POSE,
         )
 
 
